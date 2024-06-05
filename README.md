@@ -1,5 +1,5 @@
 # Ethereum Rust Client
-The objective of the Ethereum Rust client that we are building is to have a minimal and safe implementation. We believe that over usage of crates, types, concurrency damages not only the development speed of the project but it also makes it more fragile long term.
+The goal of the Ethereum Rust client we're developing is to maintain a minimal and secure implementation. We believe that excessive use of crates, types, and concurrency not only hinders the project's development speed, but also compromises its long-term stability.
 
 # Milestones
 
