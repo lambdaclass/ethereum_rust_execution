@@ -1,5 +1,5 @@
-# ethereum_rust
-Ethereum Execution client
+# Ethereum Rust Client
+The objective of the Ethereum Rust client that we are building is to have a minimal and safe implementation. We believe that over usage of crates, types, concurrency damages not only the development speed of the project but it also makes it more fragile long term.
 
 # Milestones
 
