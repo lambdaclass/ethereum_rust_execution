@@ -2,12 +2,13 @@ use std::{collections::HashMap, path::Path};
 
 use crate::types::{Account, TestUnit};
 use ethereum_rust_core::{
-    rlp::decode::RLPDecode,
-    rlp::encode::RLPEncode,
+    rlp::{decode::RLPDecode, encode::RLPEncode},
     types::{Account as CoreAccount, Block as CoreBlock, Transaction as CoreTransaction},
-    Address,
+    Address, U256,
 };
-use ethereum_rust_evm::{apply_state_transitions, evm_state, execute_tx, EvmState, SpecId};
+use ethereum_rust_evm::{
+    apply_state_transitions, beacon_root_contract_call, evm_state, execute_tx, EvmState, SpecId,
+};
 use ethereum_rust_storage::{EngineType, Store};
 
 pub fn execute_test(test_key: &str, test: &TestUnit) {
@@ -16,7 +17,20 @@ pub fn execute_test(test_key: &str, test: &TestUnit) {
     let blocks = test.blocks.clone();
     // Execute all txs in the test unit
     for block in blocks.iter() {
+        // Call beacon root contract
         let block_header = block.block_header.clone().unwrap();
+        let fork_timestamp = U256::from_dec_str("1710338135").unwrap();
+        if !block.block_header.as_ref().unwrap().number.is_zero() /*&& block_header.timestamp >= fork_timestamp*/ {
+            if let Some(parent_beacon_root) = block_header.parent_beacon_block_root {
+                beacon_root_contract_call(
+                    &mut evm_state,
+                    parent_beacon_root,
+                    &block_header.clone().into(),
+                    SpecId::CANCUN,
+                )
+                .expect("Beacn root contract call error");
+            }
+        }
         let transactions = block.transactions.as_ref().unwrap();
         for transaction in transactions.iter() {
             assert_eq!(

@@ -232,7 +232,7 @@ pub fn evm_state(store: Store) -> EvmState {
 
 pub fn beacon_root_contract_call(
     state: &mut EvmState,
-    beacon_root: B256,
+    beacon_root: H256,
     header: &BlockHeader,
     spec_id: SpecId,
 ) -> Result<ExecutionResult, EvmError> {
@@ -241,13 +241,13 @@ pub fn beacon_root_contract_call(
             &hex::decode("fffffffffffffffffffffffffffffffffffffffe").unwrap(),
         ),
         transact_to: RevmTxKind::Call(RevmAddress::from_slice(
-            &hex::decode("0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02").unwrap(),
+            &hex::decode("000F3df6D732807Ef1319fB7B8bB8522d0Beac02").unwrap(),
         )),
         nonce: None,
         gas_limit: 30_000_000,
-        value: U256::ZERO,
-        data: beacon_root.into(),
-        gas_price: U256::ZERO,
+        value: RevmU256::ZERO,
+        data: revm::primitives::Bytes::copy_from_slice(beacon_root.as_bytes()),
+        gas_price: RevmU256::ZERO,
         chain_id: None,
         gas_priority_fee: None,
         access_list: Vec::new(),
@@ -255,7 +255,9 @@ pub fn beacon_root_contract_call(
         max_fee_per_blob_gas: None,
         ..Default::default()
     };
-    let block_env = block_env(header);
+    let mut block_env = block_env(header);
+    block_env.basefee = RevmU256::ZERO;
+
     run_evm(tx_env, block_env, state, spec_id)
 }
 
