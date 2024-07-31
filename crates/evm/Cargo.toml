@@ -12,6 +12,7 @@ revm-inspectors = { version = "0.3.1" }
 revm-primitives = { version = "6.0.0" }
 bytes.workspace = true
 thiserror.workspace = true
+hex.workspace = true
 
 [lib]
 path = "./evm.rs"
