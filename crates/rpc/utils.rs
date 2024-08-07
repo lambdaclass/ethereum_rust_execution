@@ -1,6 +1,8 @@
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone)]
 pub enum RpcErr {
     MethodNotFound,
     BadParams,
@@ -57,4 +59,28 @@ pub struct RpcErrorResponse {
     pub id: i32,
     pub jsonrpc: String,
     pub error: RpcErrorMetadata,
+}
+
+pub fn rpc_response<E>(id: i32, res: Result<Value, E>) -> Json<Value>
+where
+    E: Into<RpcErrorMetadata>,
+{
+    match res {
+        Ok(result) => Json(
+            serde_json::to_value(RpcSuccessResponse {
+                id,
+                jsonrpc: "2.0".to_string(),
+                result,
+            })
+            .unwrap(),
+        ),
+        Err(error) => Json(
+            serde_json::to_value(RpcErrorResponse {
+                id,
+                jsonrpc: "2.0".to_string(),
+                error: error.into(),
+            })
+            .unwrap(),
+        ),
+    }
 }
