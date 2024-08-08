@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ethereum_rust_core::{
     types::{validate_block_header, ExecutionPayloadV3, PayloadStatus},
     H256,
@@ -71,7 +73,14 @@ pub fn new_payload_v3(
 
     // Check that block_hash is valid
     let actual_block_hash = block.header.compute_block_hash();
+    let mut tx_types = HashSet::new();
+    for tx in block.body.transactions.iter() {
+        let tx_type = tx.tx_type();
+            tx_types.insert(tx_type);
+    }
+    info!("Tx types in block: {tx_types:?}");
     if block_hash != actual_block_hash {
+        info!("[ERROR] Block hash doesnt match");
         return Ok(PayloadStatus::invalid_with_err("Invalid block hash"));
     }
     info!("Block hash {block_hash} is valid");

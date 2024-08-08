@@ -88,7 +88,7 @@ pub struct EIP4844Transaction {
     pub signature_s: U256,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
 pub enum TxType {
     #[default]
     Legacy = 0x00,
