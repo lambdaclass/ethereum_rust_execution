@@ -10,6 +10,9 @@ concurrency:
   group: ${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
+env:
+  RUST_VERSION: 1.80.1
+
 jobs:
   lint:
     name: Lint
@@ -21,7 +24,7 @@ jobs:
       - name: Rustup toolchain install
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.78.0
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
 
       - name: Run cargo check
@@ -49,7 +52,7 @@ jobs:
       - name: Rustup toolchain install
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.78.0
+          toolchain: ${{ env.RUST_VERSION }}
 
       - name: Setup just
         uses: extractions/setup-just@v2

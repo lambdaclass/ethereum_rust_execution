@@ -164,6 +164,7 @@ impl RLPxConnectionPending {
         let (frame_ciphertext, frame_mac) = frame_data.split_at_mut(padded_size);
 
         // check MAC
+        #[allow(clippy::needless_borrows_for_generic_args)]
         ingress_mac.update(&frame_ciphertext);
         let frame_mac_seed = {
             let mac_digest: [u8; 16] = ingress_mac.clone().finalize()[..16].try_into().unwrap();

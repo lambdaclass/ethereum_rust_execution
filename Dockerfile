@@ -1,4 +1,4 @@
-FROM rust:1.76 as builder
+FROM rust:1.80 as builder
 
 RUN apt-get update && apt-get install -y \
   build-essential \
