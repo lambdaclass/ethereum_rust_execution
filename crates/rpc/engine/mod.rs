@@ -58,6 +58,7 @@ pub fn new_payload_v3(
         Err(error) => return Ok(PayloadStatus::invalid_with_err(&error.to_string())),
     };
 
+    info!("Payload has block: {block_hash}");
     // Payload Validation
 
     // Check timestamp does not fall within the time frame of the Cancun fork
@@ -65,6 +66,8 @@ pub fn new_payload_v3(
         Some(cancun_time) if block.header.timestamp > cancun_time => {}
         _ => return Err(RpcErr::UnsuportedFork),
     }
+
+    info!("Payload is cancun: {block_hash}");
 
     // Check that block_hash is valid
     let actual_block_hash = block.header.compute_block_hash();

@@ -21,6 +21,8 @@ patricia-merkle-tree.workspace = true
 bytes.workspace = true
 hex.workspace = true
 lazy_static.workspace = true
+tracing.workspace = true
+num-bigint = "0.4.6"
 
 [dev-dependencies]
 hex-literal = "0.4.1"

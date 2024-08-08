@@ -1,7 +1,9 @@
 use bytes::Bytes;
 use ethereum_types::{Address, Bloom};
 use keccak_hash::H256;
+use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::rlp::decode::RLPDecode;
 use crate::{rlp::error::RLPDecodeError, serde_utils};
@@ -73,6 +75,12 @@ impl ExecutionPayloadV3 {
     /// Converts an `ExecutionPayloadV3` into a block (aka a BlockHeader and BlockBody)
     /// using the parentBeaconBlockRoot received along with the payload in the rpc call `engine_newPayloadV3`
     pub fn into_block(self, parent_beacon_block_root: H256) -> Result<Block, RLPDecodeError> {
+        for tx in self.transactions.iter() {
+            if let Err(err) = tx.decode() {
+                let tx_hex = BigUint::from_bytes_be(&tx.0);
+                info!("[ERROR] decode tx: {tx_hex:#x} with err {err}");
+            }
+        }
         let body = BlockBody {
             transactions: self
                 .transactions
