@@ -163,22 +163,33 @@ fn check_poststate_against_db(test_key: &str, test: &TestUnit, db: &Store) {
                 "Mismatched storage value for address {addr}, key {key} test:{test_key}"
             );
         }
-        // Check world state
-        // TODO: several tests won't pass, fix them to uncomment these lines
-        // let result_blocks = &test.blocks;
-        // let test_block = result_blocks.last().unwrap().header();
-        // let test_state_root = test_block.state_root;
-        // let db_block_header = db
-        //     .get_block_header(test_block.number.low_u64())
-        //     .unwrap()
-        //     .unwrap();
-        // assert_eq!(
-        //     test_state_root,
-        //     db_block_header.state_root,
-        //     "Mismatched state root for database, test: {test_key}");
-        // assert_eq!(
-        //     test_state_root,
-        //     db.clone().world_state_root(),
-        //     "Mismatched state root for world state trie, test: {test_key}");
     }
+    // Check world state
+    // get last valid block
+    let last_block = match test.genesis_block_header.hash == test.lastblockhash {
+        // lastblockhash matches genesis block
+        true => &test.genesis_block_header,
+        // lastblockhash matches a block in blocks list
+        false => test
+            .blocks
+            .iter()
+            .map(|b| b.header())
+            .find(|h| h.hash == test.lastblockhash)
+            .unwrap(),
+    };
+    let test_state_root = last_block.state_root;
+    // TODO: these checks should be enabled once we start storing the Blocks in the DB
+    // let db_block_header = db
+    //     .get_block_header(test_block.number.low_u64())
+    //     .unwrap()
+    //     .unwrap();
+    // assert_eq!(
+    //     test_state_root,
+    //     db_block_header.state_root,
+    //     "Mismatched state root for database, test: {test_key}");
+    assert_eq!(
+        test_state_root,
+        db.clone().world_state_root(),
+        "Mismatched state root for world state trie, test: {test_key}"
+    );
 }

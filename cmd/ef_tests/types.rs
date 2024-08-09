@@ -18,7 +18,7 @@ pub struct TestUnit {
     pub genesis_block_header: Header,
     #[serde(rename = "genesisRLP", with = "ethereum_rust_core::serde_utils::bytes")]
     pub genesis_rlp: Bytes,
-    pub lastblockhash: serde_json::Value,
+    pub lastblockhash: H256,
     pub network: String,
     pub post_state: HashMap<Address, Account>,
     pub pre: HashMap<Address, Account>,

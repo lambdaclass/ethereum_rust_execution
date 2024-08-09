@@ -131,7 +131,10 @@ pub fn compute_storage_root(storage: &HashMap<H256, U256>) -> H256 {
         let mut v_buf = vec![];
         let k_buf = Keccak256::new_with_prefix(k).finalize().to_vec();
         v.encode(&mut v_buf);
-        storage_trie.insert(k_buf, v_buf);
+        // zero values are removed from the trie
+        if !v.is_zero() {
+            storage_trie.insert(k_buf, v_buf);
+        }
     }
 
     // TODO check if sorting by key and using this is more efficient:
