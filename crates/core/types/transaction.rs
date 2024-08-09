@@ -7,7 +7,7 @@ use sha3::{Digest, Keccak256};
 
 use crate::rlp::{
     constants::RLP_NULL,
-    decode::{get_rlp_bytes_item_payload, is_encoded_as_bytes, RLPDecode},
+    decode::RLPDecode,
     encode::RLPEncode,
     error::RLPDecodeError,
     structs::{Decoder, Encoder},
@@ -115,6 +115,11 @@ impl RLPEncode for Transaction {
     /// B) `LegacyTransaction` (An rlp encoded LegacyTransaction)
     fn encode(&self, buf: &mut dyn bytes::BufMut) {
         match self {
+            // Legacy transactions don't have a prefix
+            Transaction::LegacyTransaction(_) => {}
+            _ => buf.put_u8(self.tx_type() as u8),
+        }
+        match self {
             Transaction::LegacyTransaction(t) => t.encode(buf),
             Transaction::EIP2930Transaction(t) => t.encode(buf),
             Transaction::EIP1559Transaction(t) => t.encode(buf),
@@ -129,33 +134,33 @@ impl RLPDecode for Transaction {
     /// A) `TransactionType || Transaction` (Where Transaction type is an 8-bit number between 0 and 0x7f, and Transaction is an rlp encoded transaction of type TransactionType)
     /// B) `LegacyTransaction` (An rlp encoded LegacyTransaction)
     fn decode_unfinished(rlp: &[u8]) -> Result<(Self, &[u8]), RLPDecodeError> {
-        if is_encoded_as_bytes(rlp) {
-            // Adjust the encoding to get the payload
-            let payload = get_rlp_bytes_item_payload(rlp);
-            let tx_type = payload.first().unwrap();
-            let tx_encoding = &payload[1..];
-            // Look at the first byte to check if it corresponds to a TransactionType
-            match *tx_type {
-                // Legacy
-                0x0 => LegacyTransaction::decode_unfinished(tx_encoding)
-                    .map(|(tx, rem)| (Transaction::LegacyTransaction(tx), rem)), // TODO: check if this is a real case scenario
-                // EIP2930
-                0x1 => EIP2930Transaction::decode_unfinished(tx_encoding)
-                    .map(|(tx, rem)| (Transaction::EIP2930Transaction(tx), rem)),
-                // EIP1559
-                0x2 => EIP1559Transaction::decode_unfinished(tx_encoding)
-                    .map(|(tx, rem)| (Transaction::EIP1559Transaction(tx), rem)),
-                // EIP4844
-                0x3 => EIP4844Transaction::decode_unfinished(tx_encoding)
-                    .map(|(tx, rem)| (Transaction::EIP4844Transaction(tx), rem)),
-                ty => Err(RLPDecodeError::Custom(format!(
-                    "Invalid transaction type: {ty}"
-                ))),
+        // Look at the first byte to check if it corresponds to a TransactionType
+        match rlp.first() {
+            // First byte is a valid TransactionType
+            Some(tx_type) if *tx_type < 0x7f => {
+                // Decode tx based on type
+                let tx_bytes = &rlp[1..];
+                match *tx_type {
+                    // Legacy
+                    0x0 => LegacyTransaction::decode_unfinished(tx_bytes)
+                        .map(|(tx, rem)| (Transaction::LegacyTransaction(tx), rem)), // TODO: check if this is a real case scenario
+                    // EIP2930
+                    0x1 => EIP2930Transaction::decode_unfinished(tx_bytes)
+                        .map(|(tx, rem)| (Transaction::EIP2930Transaction(tx), rem)),
+                    // EIP1559
+                    0x2 => EIP1559Transaction::decode_unfinished(tx_bytes)
+                        .map(|(tx, rem)| (Transaction::EIP1559Transaction(tx), rem)),
+                    // EIP4844
+                    0x3 => EIP4844Transaction::decode_unfinished(tx_bytes)
+                        .map(|(tx, rem)| (Transaction::EIP4844Transaction(tx), rem)),
+                    ty => Err(RLPDecodeError::Custom(format!(
+                        "Invalid transaction type: {ty}"
+                    ))),
+                }
             }
-        } else {
             // LegacyTransaction
-            LegacyTransaction::decode_unfinished(rlp)
-                .map(|(tx, rem)| (Transaction::LegacyTransaction(tx), rem))
+            _ => LegacyTransaction::decode_unfinished(rlp)
+                .map(|(tx, rem)| (Transaction::LegacyTransaction(tx), rem)),
         }
     }
 }
@@ -201,18 +206,17 @@ impl RLPEncode for LegacyTransaction {
             .finish();
     }
 }
-/// Receives an encoded transaction and its type and encodes both as a single rlp item
-/// that has: (tx_type || encoded_tx) as payload
-fn encode_tx_as_bytes(tx_type: u8, encoded_tx: &[u8], buf: &mut dyn bytes::BufMut) {
-    let tx = [&[tx_type], encoded_tx].concat();
-    let tx_as_bytes = Bytes::copy_from_slice(&tx);
-    tx_as_bytes.encode(buf);
-}
+// /// Receives an encoded transaction and its type and encodes both as a single rlp item
+// /// that has: (tx_type || encoded_tx) as payload
+// fn encode_tx_as_bytes(tx_type: u8, encoded_tx: &[u8], buf: &mut dyn bytes::BufMut) {
+//     let tx = [&[tx_type], encoded_tx].concat();
+//     let tx_as_bytes = Bytes::copy_from_slice(&tx);
+//     tx_as_bytes.encode(buf);
+// }
 
 impl RLPEncode for EIP2930Transaction {
     fn encode(&self, buf: &mut dyn bytes::BufMut) {
-        let mut tx_buf = Vec::new();
-        Encoder::new(&mut tx_buf)
+        Encoder::new(buf)
             .encode_field(&self.chain_id)
             .encode_field(&self.nonce)
             .encode_field(&self.gas_price)
@@ -224,16 +228,13 @@ impl RLPEncode for EIP2930Transaction {
             .encode_field(&self.signature_y_parity)
             .encode_field(&self.signature_r)
             .encode_field(&self.signature_s)
-            .finish();
-
-        encode_tx_as_bytes(TxType::EIP2930 as u8, &tx_buf, buf);
+            .finish()
     }
 }
 
 impl RLPEncode for EIP1559Transaction {
     fn encode(&self, buf: &mut dyn bytes::BufMut) {
-        let mut tx_buf = Vec::new();
-        Encoder::new(&mut tx_buf)
+        Encoder::new(buf)
             .encode_field(&self.chain_id)
             .encode_field(&self.nonce)
             .encode_field(&self.max_priority_fee_per_gas)
@@ -246,15 +247,13 @@ impl RLPEncode for EIP1559Transaction {
             .encode_field(&self.signature_y_parity)
             .encode_field(&self.signature_r)
             .encode_field(&self.signature_s)
-            .finish();
-        encode_tx_as_bytes(TxType::EIP1559 as u8, &tx_buf, buf);
+            .finish()
     }
 }
 
 impl RLPEncode for EIP4844Transaction {
     fn encode(&self, buf: &mut dyn bytes::BufMut) {
-        let mut tx_buf = Vec::new();
-        Encoder::new(&mut tx_buf)
+        Encoder::new(buf)
             .encode_field(&self.chain_id)
             .encode_field(&self.nonce)
             .encode_field(&self.max_priority_fee_per_gas)
@@ -269,9 +268,7 @@ impl RLPEncode for EIP4844Transaction {
             .encode_field(&self.signature_y_parity)
             .encode_field(&self.signature_r)
             .encode_field(&self.signature_s)
-            .finish();
-
-        encode_tx_as_bytes(TxType::EIP4844 as u8, &tx_buf, buf);
+            .finish()
     }
 }
 

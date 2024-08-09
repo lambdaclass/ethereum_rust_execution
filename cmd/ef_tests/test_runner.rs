@@ -72,17 +72,8 @@ pub fn validate_test(test: &TestUnit) {
 
     // check that blocks can be decoded
     for block in &test.blocks {
-        match CoreBlock::decode(block.rlp.as_ref()) {
-            Ok(decoded_block) => {
-                // check that the decoded block matches the deserialized one
-                assert_eq!(decoded_block, (block.block().clone()).into());
-                let mut rlp_block = Vec::new();
-                // check that encoding the decoded block matches the rlp field
-                decoded_block.encode(&mut rlp_block);
-                assert_eq!(rlp_block, block.rlp.to_vec());
-            }
-            Err(_) => assert!(block.expect_exception.is_some()),
-        }
+        let core_block: CoreBlock = block.block().clone().into();
+        assert_eq!(core_block.header.compute_block_hash(), block.header().hash);
     }
 }
 

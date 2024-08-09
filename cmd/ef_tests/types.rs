@@ -1,10 +1,10 @@
 use bytes::Bytes;
-use ethereum_rust_core::types::Withdrawal;
 use ethereum_rust_core::types::{
     code_hash, Account as ethereum_rustAccount, AccountInfo, Block as CoreBlock, BlockBody,
     EIP1559Transaction, EIP2930Transaction, EIP4844Transaction, LegacyTransaction,
     Transaction as ethereum_rustTransaction, TxKind,
 };
+use ethereum_rust_core::types::{compute_transactions_root, Withdrawal};
 use ethereum_rust_core::{types::BlockHeader, Address, Bloom, H160, H256, H64, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,10 +144,14 @@ impl BlockWithRLP {
 }
 impl From<Block> for CoreBlock {
     fn from(val: Block) -> Self {
+        let mut header: BlockHeader = val.block_header.into();
+        let transactions: Vec<ethereum_rust_core::types::Transaction> =
+            val.transactions.iter().map(|t| t.clone().into()).collect();
+        header.transactions_root = compute_transactions_root(&transactions);
         Self {
-            header: val.block_header.into(),
+            header,
             body: BlockBody {
-                transactions: val.transactions.iter().map(|t| t.clone().into()).collect(),
+                transactions,
                 ommers: val.uncle_headers.iter().map(|h| h.clone().into()).collect(),
                 withdrawals: val.withdrawals,
             },
