@@ -31,7 +31,8 @@ use crate::rlpx::p2p::SUPPORTED_ETH_CAPABILITIES;
 use crate::snap::{
     async_fs,
     constants::{
-        BYTECODE_CHUNK_SIZE, MAX_HEADER_FETCH_ATTEMPTS, MIN_FULL_BLOCKS, MISSING_SLOTS_PERCENTAGE,
+        BYTECODE_CHUNK_SIZE, MAX_HEADER_FETCH_ATTEMPTS, MAX_PENDING_ACCOUNTS_FOR_HEALING_FALLBACK,
+        MAX_STORAGE_RANGE_REQUEST_ATTEMPTS, MIN_FULL_BLOCKS, MISSING_SLOTS_PERCENTAGE,
         SECONDS_PER_BLOCK, SNAP_LIMIT,
     },
     request_account_range, request_bytecodes, request_storage_ranges,
@@ -405,7 +406,7 @@ pub async fn snap_sync(
         // is correct. To do so, we always heal the state trie before requesting storage rates
         let mut chunk_index = 0_u64;
         let mut state_leafs_healed = 0_u64;
-        let mut storage_range_request_attempts = 0;
+        let mut storage_range_request_attempts = 0_u64;
         loop {
             while block_is_stale(&pivot_header) {
                 pivot_header = update_pivot(
@@ -433,12 +434,26 @@ pub async fn snap_sync(
                 continue;
             };
 
+            let pending_accounts = storage_accounts.accounts_with_storage_root.len();
             debug!(
-                "Started request_storage_ranges with {} accounts with storage root unchanged",
-                storage_accounts.accounts_with_storage_root.len()
+                "Started request_storage_ranges with {pending_accounts} accounts with storage root unchanged"
             );
             storage_range_request_attempts += 1;
-            if storage_range_request_attempts < 5 {
+            // The attempt limit exists for accounts whose storage root reverted to a
+            // value we already downloaded: no peer can serve those ranges, so only
+            // healing gets them done. Healing is much slower per account than a range
+            // download, so the limit is ignored while the pending set is large: sending
+            // that many accounts to healing costs more sync time than another round does.
+            if storage_range_request_attempts < MAX_STORAGE_RANGE_REQUEST_ATTEMPTS
+                || pending_accounts > MAX_PENDING_ACCOUNTS_FOR_HEALING_FALLBACK
+            {
+                if storage_range_request_attempts >= MAX_STORAGE_RANGE_REQUEST_ATTEMPTS {
+                    warn!(
+                        pending_accounts,
+                        attempts = storage_range_request_attempts,
+                        "Storage ranges are past the attempt limit, but too many accounts are still pending to fall back to healing. Downloading again."
+                    );
+                }
                 chunk_index = request_storage_ranges(
                     peers,
                     &mut storage_accounts,
@@ -467,6 +482,7 @@ pub async fn snap_sync(
                 }
 
                 warn!(
+                    pending_accounts,
                     "Storage could not be downloaded after multiple attempts. Marking for healing. This could impact snap sync time (healing may take a while)."
                 );
 

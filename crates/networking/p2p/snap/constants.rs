@@ -74,6 +74,25 @@ pub const REQUEST_RETRY_ATTEMPTS: u32 = 5;
 /// Maximum number of concurrent in-flight requests during storage healing.
 pub const MAX_IN_FLIGHT_REQUESTS: u32 = 77;
 
+/// Number of `request_storage_ranges` rounds to run before the accounts whose
+/// storage is still pending are handed over to storage healing.
+///
+/// A round is one pivot cycle: the counter only advances after a state heal, and
+/// a round ends when the pivot goes stale. Accounts whose storage root reverted
+/// to a value we already downloaded can never be served by peers, so retrying
+/// them forever would stall snap sync; healing is the only way out for them.
+pub const MAX_STORAGE_RANGE_REQUEST_ATTEMPTS: u64 = 5;
+
+/// Number of still-pending accounts above which `MAX_STORAGE_RANGE_REQUEST_ATTEMPTS`
+/// is ignored and storage ranges keep being downloaded.
+///
+/// Healing a storage trie is far more expensive than downloading its range:
+/// healing walks the trie node by node against the current pivot, while a range
+/// download fetches leaves in bulk. Handing a set this large to healing costs
+/// more sync time than running further download rounds, so past this threshold
+/// the attempt limit does not apply.
+pub const MAX_PENDING_ACCOUNTS_FOR_HEALING_FALLBACK: usize = 300_000;
+
 /// Soft limit on the number of entries in a healing pending-parents queue.
 ///
 /// Shared by storage healing (`StorageHealingQueue`) and state healing
