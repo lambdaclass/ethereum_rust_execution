@@ -14,7 +14,7 @@ use bytes::Bytes;
 use ethrex_blockchain::vm::StoreVmDatabase;
 use ethrex_common::types::{
     Account, BlockHeader, Code, FRAME_RECEIPT_STATUS_SUCCESS, Fork, Frame, FrameMode,
-    FrameTransaction, Transaction,
+    FrameTransaction, GasLimits, GasUsed, Transaction,
 };
 use ethrex_common::{Address, H256, U256, constants::EMPTY_TRIE_HASH};
 use ethrex_crypto::NativeCrypto;
@@ -119,7 +119,7 @@ fn frame_tx_env(tx: &FrameTransaction) -> Environment {
         // Fine for tests that don't assert on fee amounts. Tests that check
         // payer balances MUST use `run_frame_tx_with_fees`, which derives the
         // effective price min(base+priority, max_fee) like production.
-        gas_price: U256::from(tx.max_fee_per_gas),
+        gas_price: tx.max_fee_per_gas,
         tx_nonce: tx.nonce,
         ..Default::default()
     }
@@ -135,8 +135,8 @@ fn frame_tx_with_frames(frames: Vec<Frame>) -> FrameTransaction {
         sender: FUNDED_SENDER,
         frames,
         signatures: Vec::new(),
-        max_priority_fee_per_gas: 1,
-        max_fee_per_gas: HARNESS_BASE_FEE + 1_000,
+        max_priority_fee_per_gas: U256::from(1u64),
+        max_fee_per_gas: U256::from(HARNESS_BASE_FEE + 1_000),
         max_fee_per_blob_gas: U256::zero(),
         blob_versioned_hashes: Vec::new(),
         inner_hash: Default::default(),
@@ -200,10 +200,10 @@ fn run_frame_tx_with_fees(
     let mut env = frame_tx_env(&tx);
     env.base_fee_per_gas = U256::from(base_fee);
     // Effective gas price, matching production `calculate_gas_price_for_tx`.
-    let effective = base_fee
+    let effective = U256::from(base_fee)
         .saturating_add(tx.max_priority_fee_per_gas)
         .min(tx.max_fee_per_gas);
-    env.gas_price = U256::from(effective);
+    env.gas_price = effective;
     let transaction = Transaction::FrameTransaction(tx);
 
     let result = {
@@ -253,7 +253,10 @@ fn verify_frame(target: Address) -> Frame {
         mode: u8::from(FrameMode::Verify),
         flags: 0x03,
         target: Some(target),
-        gas_limit: 100_000,
+        gas_limits: GasLimits {
+            execution: 100_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     }
@@ -341,7 +344,10 @@ fn invalid_frame_tx_leaves_db_cache_clean() {
         mode: u8::from(FrameMode::Default),
         flags: 0,
         target: Some(target),
-        gas_limit: 100_000,
+        gas_limits: GasLimits {
+            execution: 100_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     }]);
@@ -380,7 +386,10 @@ fn reverting_sender_frame_returns_value() {
             mode: u8::from(FrameMode::Sender),
             flags: 0,
             target: Some(target),
-            gas_limit: 100_000,
+            gas_limits: GasLimits {
+                execution: 100_000,
+                state: 0,
+            },
             value,
             data: Bytes::new(),
         },
@@ -450,13 +459,16 @@ fn payer_pays_effective_price_no_burn() {
             mode: u8::from(FrameMode::Sender),
             flags: 0,
             target: Some(stop_contract),
-            gas_limit: 30_000,
+            gas_limits: GasLimits {
+                execution: 30_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
     ]);
-    tx.max_fee_per_gas = 100_000_000_000; // 100 gwei
-    tx.max_priority_fee_per_gas = 2_000_000_000; // 2 gwei
+    tx.max_fee_per_gas = U256::from(100_000_000_000u64); // 100 gwei
+    tx.max_priority_fee_per_gas = U256::from(2_000_000_000u64); // 2 gwei
     let (result, db) = run_frame_tx_with_fees(
         &[
             (
@@ -523,16 +535,20 @@ fn frameparam_reads_frame_index_from_stack_top() {
             mode: u8::from(FrameMode::Default),
             flags: 0,
             target: Some(reader),
-            // EIP-8037 (active at Hegota): the new-slot SSTORE spills
-            // STATE_BYTES_PER_STORAGE_SET * cost_per_state_byte (~98k) into
-            // the frame's regular gas, so the budget must cover it.
-            gas_limit: 300_000,
+            // The frame's SSTORE creates a slot, and EIP-8141 makes the two gas
+            // dimensions independent: that EIP-8037 state cost is paid from the
+            // frame's own state budget and cannot draw on its execution gas, so
+            // the frame has to declare a budget that covers it.
+            gas_limits: GasLimits {
+                execution: 300_000,
+                state: SSTORE_SET_STATE_GAS,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
     ];
     // Set a distinctive gas_limit on frame[0] that FRAMEPARAM(param=1, frameIndex=0) must read.
-    frames[0].gas_limit = 77_777;
+    frames[0].gas_limits.execution = 77_777;
     let tx = frame_tx_with_frames(frames);
     let (result, db) = run_frame_tx(
         &[
@@ -583,7 +599,10 @@ fn approve_halts_when_frame_scope_is_none() {
         mode: u8::from(FrameMode::Default),
         flags: 0x00,
         target: Some(FUNDED_SENDER),
-        gas_limit: 100_000,
+        gas_limits: GasLimits {
+            execution: 100_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     }]);
@@ -621,7 +640,10 @@ fn batched_verify_revert_invalidates_tx() {
             mode: u8::from(FrameMode::Verify),
             flags: 0x04,
             target: Some(reverter),
-            gas_limit: 60_000,
+            gas_limits: GasLimits {
+                execution: 60_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -629,7 +651,10 @@ fn batched_verify_revert_invalidates_tx() {
             mode: u8::from(FrameMode::Default),
             flags: 0x00,
             target: Some(stop_ct),
-            gas_limit: 30_000,
+            gas_limits: GasLimits {
+                execution: 30_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -682,7 +707,10 @@ fn payment_approval_before_execution_approval_reverts() {
             mode: u8::from(FrameMode::Sender),
             flags: 0,
             target: Some(stop_ct),
-            gas_limit: 30_000,
+            gas_limits: GasLimits {
+                execution: 30_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -730,17 +758,25 @@ fn sender_frame_transfers_value_to_eoa() {
             mode: u8::from(FrameMode::Sender),
             flags: 0,
             target: Some(eoa),
-            gas_limit: 50_000,
+            gas_limits: GasLimits {
+                execution: 50_000,
+                state: 0,
+            },
             value,
             data: Bytes::new(),
         },
     ]);
-    let accounts = [(
-        FUNDED_SENDER,
-        AUTO_SEED_SENDER_BALANCE,
-        0,
-        Bytes::from(APPROVE_BOTH_CODE.to_vec()),
-    )];
+    // Seeded with a balance so the recipient is already alive: reviving a dead
+    // account is a separate, priced case (`sender_frame_reviving_a_dead_target_pays_new_account`).
+    let accounts = [
+        (
+            FUNDED_SENDER,
+            AUTO_SEED_SENDER_BALANCE,
+            0,
+            Bytes::from(APPROVE_BOTH_CODE.to_vec()),
+        ),
+        (eoa, U256::one(), 0, Bytes::new()),
+    ];
     let (result, db) = run_frame_tx(&accounts, tx);
     let report = result.expect("plain EOA transfer must be a VALID, SUCCESSFUL tx");
     // frame[1] (the SENDER frame) succeeded:
@@ -751,7 +787,11 @@ fn sender_frame_transfers_value_to_eoa() {
         "SENDER frame to a code-less EOA must succeed (default code = success)"
     );
     // The EOA actually received the value:
-    assert_eq!(balance_of(&db, eoa), value, "value not delivered to EOA");
+    assert_eq!(
+        balance_of(&db, eoa),
+        value.saturating_add(U256::one()),
+        "value not delivered to EOA"
+    );
 }
 
 #[test]
@@ -773,17 +813,23 @@ fn sender_frame_to_eoa_emits_transfer_log() {
             mode: u8::from(FrameMode::Sender),
             flags: 0,
             target: Some(eoa),
-            gas_limit: 50_000,
+            gas_limits: GasLimits {
+                execution: 50_000,
+                state: 0,
+            },
             value,
             data: Bytes::new(),
         },
     ]);
-    let accounts = [(
-        FUNDED_SENDER,
-        AUTO_SEED_SENDER_BALANCE,
-        0,
-        Bytes::from(APPROVE_BOTH_CODE.to_vec()),
-    )];
+    let accounts = [
+        (
+            FUNDED_SENDER,
+            AUTO_SEED_SENDER_BALANCE,
+            0,
+            Bytes::from(APPROVE_BOTH_CODE.to_vec()),
+        ),
+        (eoa, U256::one(), 0, Bytes::new()),
+    ];
     let (result, _db) = run_frame_tx(&accounts, tx);
     let report = result.expect("EOA transfer must be a valid, successful tx");
     let is_transfer_log = |l: &ethrex_common::types::Log| {
@@ -804,6 +850,97 @@ fn sender_frame_to_eoa_emits_transfer_log() {
     assert!(
         report.logs.iter().any(is_transfer_log),
         "EIP-7708 transfer log missing from report.logs"
+    );
+}
+
+/// A SENDER frame whose value transfer revives a dead account pays the EIP-8037
+/// NEW_ACCOUNT state cost at entry, before it runs
+/// (EELS `charge_value_transfer_to_non_alive_account`). The charge belongs to the
+/// state dimension, so it is drawn from the frame's own state budget and never
+/// from its execution gas; a frame whose state budget cannot cover it never
+/// executes and forfeits its whole execution budget.
+///
+/// Found on a devnet, not by a fixture: ethrex charged nothing here and billed
+/// the frame 3_000 while Nethermind billed it the full limit, so the two split
+/// on the header `gasUsed` of the first frame transaction that paid a fresh
+/// address.
+#[test]
+fn sender_frame_reviving_a_dead_target_pays_new_account() {
+    let dead = Address::from_low_u64_be(0xDEAD1); // never seeded: not alive
+    let value = U256::from(5_000_000u64);
+    let accounts = [(
+        FUNDED_SENDER,
+        AUTO_SEED_SENDER_BALANCE,
+        0,
+        Bytes::from(APPROVE_BOTH_CODE.to_vec()),
+    )];
+
+    let sender_frame = |execution: u64, state: u64| Frame {
+        mode: u8::from(FrameMode::Sender),
+        flags: 0,
+        target: Some(dead),
+        gas_limits: GasLimits { execution, state },
+        value,
+        data: Bytes::new(),
+    };
+
+    // Ample execution gas, but a state budget of zero: nothing can fund the
+    // account creation, since execution gas is barred from the state dimension.
+    let tx = frame_tx_with_frames(vec![verify_frame(FUNDED_SENDER), sender_frame(50_000, 0)]);
+    let (result, db) = run_frame_tx(&accounts, tx);
+    let report = result.expect("the transaction stays valid; only the frame fails");
+    let frame_results = report.frame_results.expect("frame results present");
+    assert_eq!(
+        frame_results[1].0,
+        ethrex_common::types::FRAME_RECEIPT_STATUS_FAILURE,
+        "a frame that cannot pay its entry charge must fail"
+    );
+    assert_eq!(
+        frame_results[1].1.execution, 50_000,
+        "a frame that fails at entry forfeits its whole execution budget"
+    );
+    assert_eq!(
+        frame_results[1].1.state, 0,
+        "a failed frame's state gas rolls back to the frame-entry checkpoint"
+    );
+    assert_eq!(
+        balance_of(&db, dead),
+        U256::zero(),
+        "the account must not be revived by a frame that never ran"
+    );
+
+    // The same frame with room in both dimensions runs, and is billed the cold
+    // access in execution gas and the NEW_ACCOUNT cost in state gas.
+    let tx = frame_tx_with_frames(vec![
+        verify_frame(FUNDED_SENDER),
+        sender_frame(10_000_000, 1_000_000),
+    ]);
+    let (result, db) = run_frame_tx(&accounts, tx);
+    let report = result.expect("the funded frame must succeed");
+    let frame_results = report.frame_results.expect("frame results present");
+    assert_eq!(
+        frame_results[1].0,
+        ethrex_common::types::FRAME_RECEIPT_STATUS_SUCCESS,
+        "a frame that can pay the revival charge must succeed"
+    );
+    assert_eq!(
+        balance_of(&db, dead),
+        value,
+        "the revived account must receive the value"
+    );
+    let cold_access = ethrex_levm::gas_cost::cold_account_access_cost(Fork::Hegota);
+    assert_eq!(
+        frame_results[1].1.execution, cold_access,
+        "the frame's execution gas is the target's cold access and nothing else: \
+         the revival cost belongs to the state dimension"
+    );
+    assert!(
+        frame_results[1].1.state > 0,
+        "the frame must be billed a NEW_ACCOUNT state charge, got 0"
+    );
+    assert_eq!(
+        report.state_gas_used, frame_results[1].1.state,
+        "the transaction's state dimension is the sum of the frames' receipts"
     );
 }
 
@@ -834,10 +971,14 @@ fn frame_tx_happy_path_sstore_and_log() {
             mode: u8::from(FrameMode::Sender),
             flags: 0,
             target: Some(worker),
-            // EIP-8037 (active at Hegota): the new-slot SSTORE spills
-            // STATE_BYTES_PER_STORAGE_SET * cost_per_state_byte (~98k) into
-            // the frame's regular gas, so the budget must cover it.
-            gas_limit: 300_000,
+            // The frame's SSTORE creates a slot, and EIP-8141 makes the two gas
+            // dimensions independent: that EIP-8037 state cost is paid from the
+            // frame's own state budget and cannot draw on its execution gas, so
+            // the frame has to declare a budget that covers it.
+            gas_limits: GasLimits {
+                execution: 300_000,
+                state: SSTORE_SET_STATE_GAS,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -944,7 +1085,10 @@ fn multiple_contract_frames_do_not_duplicate_logs() {
             mode: u8::from(FrameMode::Sender),
             flags: 0,
             target: Some(worker_a),
-            gas_limit: 100_000,
+            gas_limits: GasLimits {
+                execution: 100_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -953,7 +1097,10 @@ fn multiple_contract_frames_do_not_duplicate_logs() {
             mode: u8::from(FrameMode::Sender),
             flags: 0,
             target: Some(worker_b),
-            gas_limit: 100_000,
+            gas_limits: GasLimits {
+                execution: 100_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -1062,7 +1209,11 @@ fn frame_sstore_set_reports_eip8037_state_gas() {
             mode: u8::from(FrameMode::Default),
             flags: 0x00,
             target: Some(writer),
-            gas_limit: 2_000_000,
+            gas_limits: GasLimits {
+                execution: 2_000_000,
+                // The state-creating SSTORE is paid from this budget alone.
+                state: SSTORE_SET_STATE_GAS,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -1112,7 +1263,12 @@ fn reverted_frame_reports_no_state_gas() {
             mode: u8::from(FrameMode::Default),
             flags: 0x00,
             target: Some(writer),
-            gas_limit: 2_000_000,
+            gas_limits: GasLimits {
+                execution: 2_000_000,
+                // Budgeted for the set, so the SSTORE really runs and it is the
+                // REVERT -- not an undeclared budget -- that discards the state.
+                state: SSTORE_SET_STATE_GAS,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -1136,7 +1292,10 @@ fn frame_tx_below_base_blob_fee_is_rejected() {
         mode: u8::from(FrameMode::Sender),
         flags: 0x00,
         target: None,
-        gas_limit: 100_000,
+        gas_limits: GasLimits {
+            execution: 100_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     }]);
@@ -1172,20 +1331,24 @@ fn frame_tx_below_base_blob_fee_is_rejected() {
 }
 
 #[test]
-fn state_gas_reservoir_does_not_leak_across_frames() {
-    // Frame A creates then clears a slot (0 -> 5 -> 0), which credits the EIP-8037
-    // state-gas reservoir. Frame B then creates a fresh slot. Because frames are
-    // gas-isolated, A's reservoir credit must NOT subsidize B's state charge: B's
-    // gas_used must include the full state-set cost (the charge spills to
-    // gas_remaining), not be silently drawn from A's leftover credit. Without the
-    // per-frame reservoir reset, B's gas_used would be ~SSTORE_SET_STATE_GAS lower.
+fn state_gas_does_not_leak_across_frames() {
+    // Frame A creates then clears a slot (0 -> 5 -> 0), so its state charge is
+    // refilled. Frame B then creates a fresh slot. Each frame meters state gas
+    // against its own declared budget, so A's refill must NOT subsidize B: B's
+    // receipt has to carry the full state-set cost. Were both frames drawing on one
+    // shared pool, B's reported state gas would come out SSTORE_SET_STATE_GAS lower.
     let a = Address::from_low_u64_be(0xAA01);
     let b = Address::from_low_u64_be(0xBB01);
     let mk = |target| Frame {
         mode: u8::from(FrameMode::Default),
         flags: 0x00,
         target: Some(target),
-        gas_limit: 2_000_000,
+        gas_limits: GasLimits {
+            execution: 2_000_000,
+            // One state-creating set each: A's set-then-clear pair and B's single
+            // set both fit, which is the point -- neither borrows from the other.
+            state: SSTORE_SET_STATE_GAS,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     };
@@ -1218,11 +1381,10 @@ fn state_gas_reservoir_does_not_leak_across_frames() {
     let report = result.expect("valid frame tx (payer approved)");
     let fr = report.frame_results.expect("frame results present");
     // fr[0] = VERIFY, fr[1] = A (set+clear), fr[2] = B (fresh set).
-    assert!(
-        fr[2].1 > SSTORE_SET_STATE_GAS,
-        "frame B gas_used ({}) must include the full state-set cost — frame A's \
-         reservoir credit must not subsidize it",
-        fr[2].1,
+    assert_eq!(
+        fr[2].1.state, SSTORE_SET_STATE_GAS,
+        "frame B must pay the full state-set cost out of its own state pool — \
+         frame A's refill credit must not subsidize it",
     );
 }
 
@@ -1284,13 +1446,16 @@ mod frame_tx_opcode_handler_tests {
 
     #[test]
     fn frameparam_0x08_returns_frame_value() {
-        use ethrex_common::types::{Frame, FrameMode};
+        use ethrex_common::types::{Frame, FrameMode, GasLimits};
         // The 0x08 arm of OpFrameParamHandler maps directly to `frame.value`.
         let frame = Frame {
             mode: u8::from(FrameMode::Sender),
             flags: 0x00,
             target: Some(Address::from_low_u64_be(0xCAFE)),
-            gas_limit: 100_000,
+            gas_limits: GasLimits {
+                execution: 100_000,
+                state: 0,
+            },
             value: U256::from(1_234_567u64),
             data: Bytes::new(),
         };
@@ -1336,6 +1501,7 @@ mod frame_tx_opcode_handler_tests {
             approve_called_in_current_frame: false,
             max_gas: 0,
             blob_base_fee: U256::zero(),
+            outstanding_charge_owners: Default::default(),
         }
     }
 
@@ -1407,7 +1573,7 @@ mod frame_tx_opcode_handler_tests {
     #[test]
     fn txparam_0x0b_returns_signature_count() {
         let ctx = ctx_with_one_signature();
-        let result = load_tx_param(&ctx, 0x0B).unwrap();
+        let result = load_tx_param(&ctx, 0x0B, 0).unwrap();
         assert_eq!(result, U256::from(1u64));
     }
 
@@ -1423,14 +1589,15 @@ mod frame_tx_opcode_handler_tests {
             approve_called_in_current_frame: false,
             max_gas: 0,
             blob_base_fee: U256::zero(),
+            outstanding_charge_owners: Default::default(),
         };
-        let result = load_tx_param(&ctx, 0x0B).unwrap();
+        let result = load_tx_param(&ctx, 0x0B, 0).unwrap();
         assert_eq!(result, U256::zero());
     }
 
     #[test]
     fn framedataload_verify_frame_returns_real_data() {
-        use ethrex_common::types::{Frame, FrameMode};
+        use ethrex_common::types::{Frame, FrameMode, GasLimits};
         // After the VERIFY-zeroing removal, loading data from a VERIFY frame
         // should return the actual bytes in frame.data, not zero.
         let mut data = [0u8; 32];
@@ -1440,7 +1607,10 @@ mod frame_tx_opcode_handler_tests {
             mode: u8::from(FrameMode::Verify),
             flags: 0x03,
             target: Some(Address::from_low_u64_be(0xAA)),
-            gas_limit: 50_000,
+            gas_limits: GasLimits {
+                execution: 50_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::from(data.to_vec()),
         };
@@ -1916,7 +2086,7 @@ mod validation_observer_tests {
     use ethrex_common::types::Fork;
     use ethrex_common::types::Transaction;
     use ethrex_common::types::{
-        Account, AccountState, ChainConfig, Code, CodeMetadata, Frame, FrameTransaction,
+        Account, AccountState, ChainConfig, Code, CodeMetadata, Frame, FrameTransaction, GasLimits,
         frame_tx_expiry_verifier,
     };
     use ethrex_common::{Address, H256, U256};
@@ -2045,8 +2215,8 @@ mod validation_observer_tests {
             sender,
             frames,
             signatures: Vec::new(),
-            max_priority_fee_per_gas: 0,
-            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: U256::from(0u64),
+            max_fee_per_gas: U256::from(0u64),
             max_fee_per_blob_gas: U256::zero(),
             blob_versioned_hashes: Vec::new(),
             ..Default::default()
@@ -2058,7 +2228,10 @@ mod validation_observer_tests {
             mode: 1, // VERIFY
             flags,
             target: Some(target),
-            gas_limit,
+            gas_limits: GasLimits {
+                execution: gas_limit,
+                state: gas_limit,
+            },
             value: U256::zero(),
             data,
         }
@@ -2069,7 +2242,10 @@ mod validation_observer_tests {
             mode: 0, // DEFAULT
             flags: 0,
             target: Some(target),
-            gas_limit,
+            gas_limits: GasLimits {
+                execution: gas_limit,
+                state: gas_limit,
+            },
             value: U256::zero(),
             data,
         }
@@ -2156,7 +2332,23 @@ mod validation_observer_tests {
         let code = Bytes::from(vec![0x42, 0x50, 0x00]);
         // 8-byte deadline data, far in the future.
         let data = Bytes::from(vec![0xff; 8]);
-        let tx = frame_tx_for_obs(sender, vec![verify_frame_obs(expiry, 50_000, 0x00, data)]);
+        // EIP-8141 statically rejects an expiry verifier frame that declares any
+        // state gas -- the protocol code it runs creates no state -- so this frame
+        // cannot use `verify_frame_obs`, which budgets both dimensions.
+        let tx = frame_tx_for_obs(
+            sender,
+            vec![Frame {
+                mode: 1, // VERIFY
+                flags: 0x00,
+                target: Some(expiry),
+                gas_limits: GasLimits {
+                    execution: 50_000,
+                    state: 0,
+                },
+                value: U256::zero(),
+                data,
+            }],
+        );
         let mut db = build_db(vec![
             (sender, account_with_code(0, Bytes::new())),
             (expiry, account_with_code(0, code)),
@@ -2402,7 +2594,7 @@ mod frame_validation_prefix_tests {
     use ethrex_common::types::Transaction;
     use ethrex_common::types::{
         Account, AccountState, BlockHeader, ChainConfig, Code, CodeMetadata, Frame,
-        FrameTransaction, PrefixShape, ValidationPrefix,
+        FrameTransaction, GasLimits, PrefixShape, ValidationPrefix,
     };
     use ethrex_common::{Address, H256, U256};
     use ethrex_crypto::NativeCrypto;
@@ -2512,7 +2704,10 @@ mod frame_validation_prefix_tests {
             mode,
             flags,
             target: Some(target),
-            gas_limit,
+            gas_limits: GasLimits {
+                execution: gas_limit,
+                state: gas_limit,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         }
@@ -2525,8 +2720,8 @@ mod frame_validation_prefix_tests {
             sender,
             frames,
             signatures: Vec::new(),
-            max_priority_fee_per_gas: 0,
-            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: U256::from(0u64),
+            max_fee_per_gas: U256::from(0u64),
             max_fee_per_blob_gas: U256::zero(),
             blob_versioned_hashes: Vec::new(),
             ..Default::default()
@@ -2739,6 +2934,7 @@ mod atomic_batch_approval_rollback_tests {
             approve_called_in_current_frame: false,
             max_gas: 0,
             blob_base_fee: U256::zero(),
+            outstanding_charge_owners: Default::default(),
         }
     }
 
@@ -2746,12 +2942,12 @@ mod atomic_batch_approval_rollback_tests {
     fn batch_revert_rolls_back_in_batch_approvals() {
         let mut ctx = minimal_ctx();
         // execute_frame_tx snapshots at batch entry...
-        let snapshot = ctx.approval_snapshot();
+        let snapshot = ctx.snapshot(None);
         // ...an in-batch frame calls APPROVE(EXECUTION_AND_PAYMENT)...
         ctx.sender_approved = true;
         ctx.payer_address = Some(Address::from_low_u64_be(0xBEEF));
         // ...a later in-batch frame fails and the batch reverts:
-        ctx.restore_approvals(snapshot);
+        ctx.restore(snapshot);
         assert!(
             !ctx.sender_approved,
             "in-batch sender approval must not survive batch revert"
@@ -2768,9 +2964,9 @@ mod atomic_batch_approval_rollback_tests {
         // Approval granted by a frame BEFORE the batch:
         ctx.sender_approved = true;
         ctx.payer_address = Some(Address::from_low_u64_be(0xA11CE));
-        let snapshot = ctx.approval_snapshot();
+        let snapshot = ctx.snapshot(None);
         // In-batch frame does something; batch reverts:
-        ctx.restore_approvals(snapshot);
+        ctx.restore(snapshot);
         assert!(
             ctx.sender_approved,
             "pre-batch sender approval must survive"
@@ -3312,11 +3508,11 @@ mod expiry_verifier_tests {
     }
 }
 
-// ==================== SIGPARAM (0xB4) execution ====================
+// ============== SIGPARAM (0xB4) / SIGDATACOPY (0xB5) execution ==============
 
-/// End-to-end SIGPARAM tests: a DEFAULT frame runs real `SIGPARAM` bytecode and
-/// persists the result, so the opcode's stack order, gas and halt conditions are
-/// exercised rather than reimplemented.
+/// End-to-end `SIGPARAM`/`SIGDATACOPY` tests: a DEFAULT frame runs the real
+/// bytecode and persists the result, so each opcode's stack order, gas and halt
+/// conditions are exercised rather than reimplemented.
 mod sigparam_execution_tests {
     use super::*;
     use ethrex_common::types::{
@@ -3346,23 +3542,21 @@ mod sigparam_execution_tests {
         ])
     }
 
-    /// `SIGPARAM(0x04, index)` copying `length` bytes from `dataOffset` to
-    /// `memOffset`, then `SSTORE(0, MLOAD(memOffset))`. The copy form takes
-    /// `[signatureIndex, param, memOffset, dataOffset, length]` with the index on
-    /// top, so the pushes run in reverse.
-    fn sigparam_copy_code(index: u8, length: u8, data_offset: u8, mem_offset: u8) -> Bytes {
+    /// `SIGDATACOPY` copying `length` bytes of signature `index` from
+    /// `dataOffset` to `memOffset`, then `SSTORE(0, MLOAD(memOffset))`. The
+    /// operands are `[signatureIndex, length, dataOffset, memOffset]` with
+    /// `memOffset` on top, matching `CALLDATACOPY`, so the pushes run in reverse.
+    fn sigdatacopy_code(index: u8, length: u8, data_offset: u8, mem_offset: u8) -> Bytes {
         Bytes::from(vec![
+            0x60,
+            index, // PUSH1 signatureIndex
             0x60,
             length, // PUSH1 length
             0x60,
             data_offset, // PUSH1 dataOffset
             0x60,
             mem_offset, // PUSH1 memOffset
-            0x60,
-            0x04, // PUSH1 param (copy)
-            0x60,
-            index, // PUSH1 signatureIndex
-            0xB4,  // SIGPARAM
+            0xB5,       // SIGDATACOPY
             0x60,
             mem_offset, // PUSH1 memOffset
             0x51,       // MLOAD
@@ -3390,7 +3584,13 @@ mod sigparam_execution_tests {
                 mode: u8::from(FrameMode::Default),
                 flags: 0,
                 target: Some(reader),
-                gas_limit: 200_000,
+                gas_limits: GasLimits {
+                    execution: 200_000,
+                    // The reader persists what it read, so it needs a state
+                    // budget for that set -- without one the SSTORE runs out of
+                    // state gas and every assertion below reads back zero.
+                    state: SSTORE_SET_STATE_GAS,
+                },
                 value: U256::zero(),
                 data: Bytes::new(),
             },
@@ -3458,11 +3658,27 @@ mod sigparam_execution_tests {
     }
 
     #[test]
-    fn sigparam_0x04_copies_arbitrary_signature_bytes() {
+    fn sigparam_0x04_is_no_longer_a_valid_parameter() {
+        // EIP-8141 made SIGPARAM static-arity over 0x00-0x03: the copy it used to
+        // perform at 0x04 is SIGDATACOPY's job now, so 0x04 is simply out of range
+        // and halts. Pinned here because a handler that still accepted it would
+        // read the wrong operand count off the stack and go unnoticed otherwise.
+        let (result, db, reader) = run_reader(
+            sigparam_metadata_code(0x04, 0),
+            vec![arbitrary_sig(vec![0xAA; 4])],
+        );
+        let report = result.expect("the tx itself stays valid; only the reader frame halts");
+        let frame_results = report.frame_results.expect("per-frame results");
+        assert_eq!(frame_results[1].0, FRAME_RECEIPT_STATUS_FAILURE);
+        assert_eq!(storage_of(&db, reader, U256::zero()), U256::zero());
+    }
+
+    #[test]
+    fn sigdatacopy_copies_arbitrary_signature_bytes() {
         // 4 payload bytes copied into memory at 0; MLOAD reads them left-aligned
         // in the word, with the rest zero-filled.
         let (result, db, reader) = run_reader(
-            sigparam_copy_code(0, 4, 0, 0),
+            sigdatacopy_code(0, 4, 0, 0),
             vec![arbitrary_sig(vec![0xDE, 0xAD, 0xBE, 0xEF])],
         );
         result.expect("valid tx");
@@ -3475,10 +3691,10 @@ mod sigparam_execution_tests {
     }
 
     #[test]
-    fn sigparam_0x04_zero_fills_past_the_end() {
+    fn sigdatacopy_zero_fills_past_the_end() {
         // Asking for 8 bytes of a 2-byte signature zero-fills the remainder.
         let (result, db, reader) = run_reader(
-            sigparam_copy_code(0, 8, 0, 0),
+            sigdatacopy_code(0, 8, 0, 0),
             vec![arbitrary_sig(vec![0x11, 0x22])],
         );
         result.expect("valid tx");
@@ -3491,13 +3707,13 @@ mod sigparam_execution_tests {
     }
 
     #[test]
-    fn sigparam_0x04_reads_operands_in_calldatacopy_order() {
-        // The copy operands follow `CALLDATACOPY`: memOffset above dataOffset
-        // above length. Distinct values for all three, and a destination past the
-        // first word, pin the order — reading them in any other order lands the
-        // bytes somewhere else (or copies a different count).
+    fn sigdatacopy_reads_operands_in_calldatacopy_order() {
+        // The operands follow `CALLDATACOPY`: memOffset above dataOffset above
+        // length. Distinct values for all three, and a destination past the first
+        // word, pin the order — reading them in any other order lands the bytes
+        // somewhere else (or copies a different count).
         let (result, db, reader) = run_reader(
-            sigparam_copy_code(0, 3, 1, 0x20),
+            sigdatacopy_code(0, 3, 1, 0x20),
             vec![arbitrary_sig(vec![0xAA, 0xBB, 0xCC, 0xDD])],
         );
         result.expect("valid tx");
@@ -3641,7 +3857,12 @@ fn storage_refund_from_a_later_frame_reduces_reported_gas() {
         mode: u8::from(FrameMode::Default),
         flags: 0,
         target: Some(target),
-        gas_limit: 200_000,
+        gas_limits: GasLimits {
+            execution: 200_000,
+            // The setting frame creates the slot out of its own state budget; the
+            // clearing frame's refill returns that gas to the payer.
+            state: SSTORE_SET_STATE_GAS,
+        },
         value: U256::zero(),
         data,
     };
@@ -3676,7 +3897,7 @@ fn storage_refund_from_a_later_frame_reduces_reported_gas() {
 
     // Per-frame `gas_used` is reported before refunds, so the pre-refund total is
     // the mandatory costs plus the data cost plus each frame's gas.
-    let frames_gas: u64 = frame_results.iter().map(|(_, gas, _)| *gas).sum();
+    let frames_gas: u64 = frame_results.iter().map(|(_, gas, _)| gas.total()).sum();
     let pre_refund = tx.mandatory_gas() + tx.data_cost() + frames_gas;
     assert!(
         report.gas_used < pre_refund,
@@ -3706,7 +3927,10 @@ fn max_gas_reserves_the_calldata_floor_instead_of_rejecting() {
         mode: u8::from(FrameMode::Verify),
         flags: 0x03,
         target: Some(FUNDED_SENDER),
-        gas_limit: 1_000,
+        gas_limits: GasLimits {
+            execution: 1_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::from(vec![0x11u8; 4_096]),
     }]);
@@ -3738,7 +3962,10 @@ fn a_floor_bound_frame_transaction_is_charged_the_floor() {
         mode: u8::from(FrameMode::Verify),
         flags: 0x03,
         target: Some(FUNDED_SENDER),
-        gas_limit: 100_000,
+        gas_limits: GasLimits {
+            execution: 100_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::from(vec![0x11u8; 4_096]),
     }]);
@@ -3805,7 +4032,10 @@ fn atomic_batch_revert_drops_the_batch_writes_from_the_bal() {
         mode: u8::from(FrameMode::Sender),
         flags: 0x04,
         target: Some(target),
-        gas_limit: 300_000,
+        gas_limits: GasLimits {
+            execution: 300_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     };
@@ -3813,7 +4043,10 @@ fn atomic_batch_revert_drops_the_batch_writes_from_the_bal() {
         mode: u8::from(FrameMode::Sender),
         flags: 0x00,
         target: Some(target),
-        gas_limit: 100_000,
+        gas_limits: GasLimits {
+            execution: 100_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     };
@@ -3821,7 +4054,10 @@ fn atomic_batch_revert_drops_the_batch_writes_from_the_bal() {
         mode: u8::from(FrameMode::Verify),
         flags: 0x03,
         target: Some(FUNDED_SENDER),
-        gas_limit: 80_000,
+        gas_limits: GasLimits {
+            execution: 80_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     };
@@ -3897,6 +4133,118 @@ fn atomic_batch_revert_drops_the_batch_writes_from_the_bal() {
     );
 }
 
+/// EIP-7928: a frame that reverts on its own — with no atomic batch involved —
+/// commits no state, so the recorder must forget its writes exactly as it does
+/// for an unrolled batch. The slot is still *accessed*, so it must be reported
+/// as a read: dropping the write without re-filing it would leave the slot in
+/// neither `storage_changes` nor `storage_reads`, and re-execution (whose shadow
+/// recorder sees the raw SLOAD) then rejects the block the builder just made.
+///
+/// The write-then-read order is the load-bearing part: `record_storage_read`
+/// suppresses a read for a slot that is already written, so the read leaves no
+/// record of its own and the reverted write is the only thing standing in for it.
+#[test]
+fn reverted_frame_refiles_its_writes_as_reads_in_the_bal() {
+    use ethrex_common::types::Frame;
+
+    let target = Address::from_low_u64_be(0x8141_0101);
+    let slot = U256::from(5);
+
+    // SSTORE(5, 1) ; SLOAD(5) ; POP ; REVERT(0, 0)
+    let code = Bytes::from(vec![
+        0x60, 0x01, 0x60, 0x05, 0x55, // SSTORE(5, 1)
+        0x60, 0x05, 0x54, 0x50, // SLOAD(5) ; POP
+        0x60, 0x00, 0x60, 0x00, 0xFD, // REVERT(0, 0)
+    ]);
+
+    let accounts: Vec<SeededAccount> = vec![
+        (
+            FUNDED_SENDER,
+            AUTO_SEED_SENDER_BALANCE,
+            0,
+            Bytes::from(APPROVE_BOTH_CODE.to_vec()),
+        ),
+        (target, U256::zero(), 0, code),
+    ];
+
+    let verify = Frame {
+        mode: u8::from(FrameMode::Verify),
+        flags: 0x03,
+        target: Some(FUNDED_SENDER),
+        gas_limits: GasLimits {
+            execution: 80_000,
+            state: 0,
+        },
+        value: U256::zero(),
+        data: Bytes::new(),
+    };
+    // A plain DEFAULT frame: no atomic-batch flag, so the batch unroll path that
+    // already reconciles the recorder is deliberately not exercised here.
+    let reverting = Frame {
+        mode: u8::from(FrameMode::Default),
+        flags: 0x00,
+        target: Some(target),
+        gas_limits: GasLimits {
+            execution: 300_000,
+            state: 0,
+        },
+        value: U256::zero(),
+        data: Bytes::new(),
+    };
+
+    let tx = frame_tx_with_frames(vec![verify, reverting]);
+    let mut db = seeded_db(&accounts);
+    db.enable_bal_recording();
+    let env = frame_tx_env(&tx);
+    let transaction = Transaction::FrameTransaction(tx);
+    {
+        let mut vm = VM::new(
+            env,
+            &mut db,
+            &transaction,
+            LevmCallTracer::disabled(),
+            VMType::L1,
+            &NativeCrypto,
+            None,
+        )
+        .expect("VM::new should succeed for a frame tx");
+        vm.execute()
+            .expect("a reverting DEFAULT frame must not error the tx");
+    }
+
+    // The frame reverted, so the write must not survive in state.
+    let live = db
+        .current_accounts_state
+        .get(&target)
+        .and_then(|acc| acc.storage.get(&H256::from_low_u64_be(5)).copied())
+        .unwrap_or_default();
+    assert!(
+        live.is_zero(),
+        "the frame reverted, so the write must not survive; got {live}"
+    );
+
+    let bal = db
+        .bal_recorder
+        .take()
+        .expect("BAL recording was enabled")
+        .build();
+    let entry = bal
+        .accounts()
+        .iter()
+        .find(|acc| acc.address == target)
+        .expect("the reverting frame's target was accessed, so it must be in the BAL");
+    assert!(
+        entry.storage_changes.iter().all(|c| c.slot != slot),
+        "the BAL must not claim a storage change for a slot whose write was reverted"
+    );
+    assert!(
+        entry.storage_reads.contains(&slot),
+        "the reverted write must be re-filed as a read so the slot is still \
+         reported as accessed; otherwise re-execution rejects the block \
+         (slot missing from both storage_changes and storage_reads)"
+    );
+}
+
 /// EIP-8141: when an atomic batch unrolls, "logs emitted by frames that executed
 /// before the failure are discarded together with their state changes [...] Those
 /// frame receipts retain their execution status and gas used, with empty logs."
@@ -3939,7 +4287,10 @@ fn atomic_batch_unroll_keeps_frame_status_and_gas_but_drops_logs() {
         mode: u8::from(FrameMode::Sender),
         flags: 0x04,
         target: Some(target),
-        gas_limit: BATCH_FRAME_GAS,
+        gas_limits: GasLimits {
+            execution: BATCH_FRAME_GAS,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     };
@@ -3954,7 +4305,10 @@ fn atomic_batch_unroll_keeps_frame_status_and_gas_but_drops_logs() {
             mode: u8::from(FrameMode::Sender),
             flags: 0x00,
             target: Some(terminator),
-            gas_limit: 100_000,
+            gas_limits: GasLimits {
+                execution: 100_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -3970,9 +4324,14 @@ fn atomic_batch_unroll_keeps_frame_status_and_gas_but_drops_logs() {
         "a frame that succeeded before the failure keeps its status through the unroll"
     );
     assert!(
-        frames[1].1 > 0 && frames[1].1 < BATCH_FRAME_GAS,
-        "it keeps the gas it used ({}), not the frame's whole gas_limit",
-        frames[1].1
+        frames[1].1.execution > 0 && frames[1].1.execution < BATCH_FRAME_GAS,
+        "it keeps the execution gas it used ({}), not the frame's whole budget",
+        frames[1].1.execution
+    );
+    assert_eq!(
+        frames[1].1.state, 0,
+        "the unroll zeroes the state gas of the frames it unrolls: nothing it \
+         created survives"
     );
     assert!(
         frames[1].2.is_empty(),
@@ -3983,14 +4342,18 @@ fn atomic_batch_unroll_keeps_frame_status_and_gas_but_drops_logs() {
     // The failing frame reverted, so it is charged what it actually used.
     assert_eq!(frames[2].0, FRAME_RECEIPT_STATUS_FAILURE);
     assert!(
-        frames[2].1 < BATCH_FRAME_GAS,
-        "a REVERT is charged its actual gas ({}), not the full gas_limit",
-        frames[2].1
+        frames[2].1.execution < BATCH_FRAME_GAS,
+        "a REVERT is charged its actual execution gas ({}), not the full budget",
+        frames[2].1.execution
     );
 
     // The remaining batch member never executed.
     assert_eq!(frames[3].0, FRAME_RECEIPT_STATUS_SKIPPED);
-    assert_eq!(frames[3].1, 0, "a skipped frame's gas is refunded");
+    assert_eq!(
+        frames[3].1,
+        GasUsed::default(),
+        "a skipped frame's gas is refunded in both dimensions"
+    );
 
     // The transaction's log set is the concatenation of the frame receipts' logs,
     // so the unrolled batch contributes nothing to it either.

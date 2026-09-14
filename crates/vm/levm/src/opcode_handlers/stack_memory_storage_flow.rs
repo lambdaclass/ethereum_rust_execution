@@ -27,7 +27,7 @@ use crate::{
     utils::{size_offset_to_usize, u256_to_usize},
     vm::VM,
 };
-use ethrex_common::{H256, U256, types::Fork};
+use ethrex_common::{BigEndianHash, H256, U256, types::Fork};
 use std::{mem, slice};
 
 /// Implementation for the `POP` opcode.
@@ -353,7 +353,9 @@ impl OpcodeHandler for OpSStoreHandler {
             )?)?;
 
         if needs_state_gas {
-            vm.increase_state_gas(vm.state_gas_storage_set)?;
+            // EIP-8141 attributes the charge to the frame that paid it, so a later
+            // frame clearing the slot refills that frame rather than its own pool.
+            vm.charge_storage_set_state_gas(to, H256::from_uint(&storage_slot_key))?;
         }
         // EIP-8037 (Amsterdam+) 0→N→0: the slot was created in this tx (original == 0),
         // dirtied to N (current_value != 0), and now being reset to 0 (value == original == 0).
@@ -417,7 +419,7 @@ impl OpcodeHandler for OpSStoreHandler {
 
         // EIP-8037: credit the state gas refund via clamp-and-spill (after regular gas processing).
         if is_zero_to_n_to_zero_amsterdam {
-            vm.credit_state_gas_refund(vm.state_gas_storage_set)?;
+            vm.refill_storage_set_state_gas(to, H256::from_uint(&storage_slot_key))?;
         }
 
         if value != current_value {

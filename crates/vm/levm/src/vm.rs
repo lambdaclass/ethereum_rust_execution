@@ -31,7 +31,7 @@ use ethrex_common::{
     Address, BigEndianHash, H160, H256, U256,
     tracing::CallType,
     types::{
-        AccessListEntry, Code, Fork, Frame, FrameMode, Log, Transaction, TxType,
+        AccessListEntry, Code, Fork, Frame, FrameMode, GasUsed, Log, Transaction, TxType,
         block_access_list::BlockAccessListCheckpoint, fee_config::FeeConfig,
     },
 };
@@ -508,8 +508,13 @@ pub struct FrameTxContext {
     pub payer_address: Option<Address>,
     /// Per-frame execution results (status, gas_used, logs).
     /// `status` is a `FRAME_RECEIPT_STATUS_*` code (0 = failure, 1 = success,
-    /// 3 = skipped due to failed atomic batch).
-    pub frame_results: Vec<(u8, u64, Vec<Log>)>,
+    /// 2 = skipped due to failed atomic batch).
+    ///
+    /// Entries are not final until the transaction ends: a later frame's refill of
+    /// a state charge lowers the owning frame's `gas_used.state` in place, and an
+    /// atomic-batch unroll zeroes the state gas and empties the logs of the
+    /// unrolled frames' entries.
+    pub frame_results: Vec<(u8, GasUsed, Vec<Log>)>,
     /// Index of the currently executing frame
     pub current_frame_index: usize,
     /// The sig_hash of the frame transaction
@@ -527,25 +532,53 @@ pub struct FrameTxContext {
     /// (EIP-8141 §Gas accounting), and `load_tx_param` has no `Environment`
     /// handle to read it from.
     pub blob_base_fee: U256,
+    /// EIP-8141: for each storage slot whose creation charge is outstanding, the
+    /// index of the frame that paid it. A refill of the slot lowers that frame's
+    /// attributed state gas -- the executing frame's pool when it is the owner,
+    /// its receipt entry otherwise -- and clears the entry either way. Without the
+    /// map, a later frame's refill would credit its own pool for a charge it never
+    /// paid, granting it budget the transaction never declared.
+    pub outstanding_charge_owners: FxHashMap<(Address, H256), usize>,
+}
+
+/// EIP-8141 frame-context snapshot: the context fields that must roll back with
+/// the transaction state.
+///
+/// `APPROVE`'s state-side effects (the sender's nonce increment and the payment
+/// escrow) are state writes that roll back with the state, so the fields
+/// recording the approval must roll back in the same motion — as must the state
+/// gas pool, the receipts a cross-frame refill may have edited, and the
+/// outstanding-charge ownership map. Paired with the state snapshot taken at
+/// frame entry and at atomic-batch entry.
+#[derive(Debug, Clone)]
+pub struct FrameContextSnapshot {
+    sender_approved: bool,
+    payer_address: Option<Address>,
+    frame_results: Vec<(u8, GasUsed, Vec<Log>)>,
+    state_gas_pool: Option<u64>,
+    outstanding_charge_owners: FxHashMap<(Address, H256), usize>,
 }
 
 impl FrameTxContext {
-    /// Capture the approval state at atomic-batch entry. A batch revert rolls
-    /// back the payer's balance deduction and the sender nonce increment, so
-    /// approvals granted inside the batch must be rolled back with it —
-    /// otherwise a reverted APPROVE would leave the transaction authorized
-    /// by a frame whose effects no longer exist.
-    pub fn approval_snapshot(&self) -> (bool, Option<Address>) {
-        (self.sender_approved, self.payer_address)
+    /// Capture the mutable context fields, to be restored on failure.
+    pub fn snapshot(&self, state_gas_pool: Option<u64>) -> FrameContextSnapshot {
+        FrameContextSnapshot {
+            sender_approved: self.sender_approved,
+            payer_address: self.payer_address,
+            frame_results: self.frame_results.clone(),
+            state_gas_pool,
+            outstanding_charge_owners: self.outstanding_charge_owners.clone(),
+        }
     }
 
-    /// Restore the approval state captured by `approval_snapshot` when the
-    /// enclosing atomic batch reverts. Approvals granted before the batch
-    /// are unaffected (the snapshot includes them).
-    pub fn restore_approvals(&mut self, snapshot: (bool, Option<Address>)) {
-        let (sender_approved, payer_address) = snapshot;
-        self.sender_approved = sender_approved;
-        self.payer_address = payer_address;
+    /// Restore the mutable context fields from a copy taken by `snapshot`,
+    /// returning the state gas pool the caller must restore alongside.
+    pub fn restore(&mut self, snapshot: FrameContextSnapshot) -> Option<u64> {
+        self.sender_approved = snapshot.sender_approved;
+        self.payer_address = snapshot.payer_address;
+        self.frame_results = snapshot.frame_results;
+        self.outstanding_charge_owners = snapshot.outstanding_charge_owners;
+        snapshot.state_gas_pool
     }
 }
 
@@ -645,6 +678,14 @@ pub struct VM<'a> {
     pub state_gas_used: i64,
     /// EIP-8037: State gas reservoir pre-funded from excess gas_limit (Amsterdam+).
     pub state_gas_reservoir: u64,
+    /// EIP-8141: state gas remaining in the executing frame's pool, seeded from the
+    /// frame's declared `gas_limits.state` at frame entry; `None` for every other
+    /// transaction type. A frame transaction declares its state budgets explicitly
+    /// per frame, so it carries no reservoir: while the pool is `Some`, state
+    /// charges draw from it alone and a charge exceeding it is an out-of-gas halt
+    /// of the current call frame. Execution gas can never fund a state charge, and
+    /// unused state gas is not available to the execution dimension.
+    pub frame_state_gas_pool: Option<u64>,
     /// EIP-8037: Initial reservoir at tx start (before any execution). Captured in
     /// add_intrinsic_gas so block-dimensional regular gas can be computed
     /// independently of mid-tx reservoir activity (auth refunds, SSTORE credits).
@@ -1067,6 +1108,7 @@ impl<'a> VM<'a> {
             preserve_top_level_backup,
             state_gas_used: 0,
             state_gas_reservoir: 0,
+            frame_state_gas_pool: None,
             state_gas_reservoir_initial: 0,
             state_gas_spill: 0,
             cost_per_state_byte: cpsb,
@@ -1147,6 +1189,21 @@ impl<'a> VM<'a> {
             self.env.config.fork >= Fork::Amsterdam,
             "increase_state_gas called pre-Amsterdam"
         );
+        // EIP-8141: inside a frame transaction the executing frame's pool is the only
+        // source of state gas. Execution gas can never fund a state charge, so a
+        // charge exceeding the pool is an out-of-gas halt of the current call frame
+        // rather than a spill -- the two dimensions are independent budgets.
+        if let Some(pool) = self.frame_state_gas_pool {
+            let Some(remaining) = pool.checked_sub(gas) else {
+                return Err(ExceptionalHalt::OutOfGas.into());
+            };
+            self.frame_state_gas_pool = Some(remaining);
+            self.state_gas_used = self
+                .state_gas_used
+                .checked_add(i64::try_from(gas).map_err(|_| InternalError::Overflow)?)
+                .ok_or(InternalError::Overflow)?;
+            return Ok(());
+        }
         // Draw from reservoir first; only spill to gas_remaining if reservoir exhausted
         let from_reservoir = self.state_gas_reservoir.min(gas);
         // Safe: from_reservoir <= gas
@@ -1195,6 +1252,20 @@ impl<'a> VM<'a> {
             self.env.config.fork >= Fork::Amsterdam,
             "credit_state_gas_refund called pre-Amsterdam"
         );
+        // EIP-8141: a refund inside a frame transaction returns to the executing
+        // frame's pool. A refund only ever undoes a charge the same frame paid, so
+        // the pool can never exceed the frame's declared budget -- a refill of a
+        // charge an EARLIER frame paid goes through `credit_frame_state_gas_refund`,
+        // which lowers the owning frame's receipt instead.
+        if let Some(pool) = self.frame_state_gas_pool {
+            self.frame_state_gas_pool =
+                Some(pool.checked_add(amount).ok_or(InternalError::Overflow)?);
+            self.state_gas_used = self
+                .state_gas_used
+                .checked_sub(i64::try_from(amount).map_err(|_| InternalError::Overflow)?)
+                .ok_or(InternalError::Overflow)?;
+            return Ok(());
+        }
         // LIFO: drain the frame's spill (gas borrowed from gas_remaining) first.
         let from_gas_left = self.current_call_frame.frame_state_gas_spilled.min(amount);
         // Return the spilled portion to gas_remaining (i64).
@@ -1223,6 +1294,69 @@ impl<'a> VM<'a> {
             .checked_sub(i64::try_from(amount).map_err(|_| InternalError::Overflow)?)
             .ok_or(InternalError::Overflow)?;
         Ok(())
+    }
+
+    /// EIP-8037 storage-slot creation charge, with EIP-8141 ownership tracking.
+    ///
+    /// A frame transaction attributes each outstanding slot-creation charge to the
+    /// frame that paid it, so a later frame clearing the slot returns the gas to
+    /// that frame rather than to its own pool. Outside a frame transaction this is
+    /// exactly `increase_state_gas`.
+    pub fn charge_storage_set_state_gas(
+        &mut self,
+        address: Address,
+        key: H256,
+    ) -> Result<(), VMError> {
+        self.increase_state_gas(self.state_gas_storage_set)?;
+        if let Some(ctx) = self.frame_tx_context.as_mut() {
+            let owner = ctx.current_frame_index;
+            ctx.outstanding_charge_owners.insert((address, key), owner);
+        }
+        Ok(())
+    }
+
+    /// EIP-8037 storage-slot refill, with EIP-8141 cross-frame attribution.
+    ///
+    /// The refill lowers the attributed state gas of the frame that paid the
+    /// charge: back into the executing frame's own pool when it is the owner, and
+    /// out of the owner's receipt entry otherwise — returning the amount to the
+    /// payer at settlement without granting the executing frame budget it never
+    /// declared. Either way the ownership entry is cleared. Outside a frame
+    /// transaction this is exactly `credit_state_gas_refund`.
+    pub fn refill_storage_set_state_gas(
+        &mut self,
+        address: Address,
+        key: H256,
+    ) -> Result<(), VMError> {
+        let amount = self.state_gas_storage_set;
+        let owner = self.frame_tx_context.as_mut().and_then(|ctx| {
+            ctx.outstanding_charge_owners
+                .remove(&(address, key))
+                .filter(|owner| *owner != ctx.current_frame_index)
+        });
+        match owner {
+            // The charge belongs to an earlier frame: lower its receipt in place.
+            // Its budget less its receipt is what settlement counts as unused, so
+            // the refilled gas reaches the payer without passing through this
+            // frame's pool.
+            Some(owner) => {
+                let ctx = self.frame_tx_context.as_mut().ok_or(VMError::Internal(
+                    InternalError::Custom("missing frame tx context".to_string()),
+                ))?;
+                if let Some((_, gas_used, _)) = ctx.frame_results.get_mut(owner) {
+                    gas_used.state = gas_used.state.saturating_sub(amount);
+                }
+                // The refill reverses a charge for state that was never durably
+                // created, so it bypasses the EIP-3529 refund cap by lowering the
+                // transaction's pre-refund usage directly.
+                self.state_gas_used = self
+                    .state_gas_used
+                    .checked_sub(i64::try_from(amount).map_err(|_| InternalError::Overflow)?)
+                    .ok_or(InternalError::Overflow)?;
+                Ok(())
+            }
+            None => self.credit_state_gas_refund(amount),
+        }
     }
 
     /// Refund the EIP-8037 new-account state gas when `charged` is true. Used by the
@@ -1327,6 +1461,29 @@ impl<'a> VM<'a> {
             .state_gas_used
             .checked_sub(entry)
             .ok_or(InternalError::Underflow)?;
+        // EIP-8141: a frame transaction's state gas comes wholly from the executing
+        // frame's pool and never spills, so an internal call frame's rollback simply
+        // returns its net charge to the pool. `process_call`'s rollback stops at the
+        // call; the frame loop's own frame-entry snapshot extends it over the
+        // frame-entry charges when the whole frame fails.
+        if let Some(pool) = self.frame_state_gas_pool {
+            let restored = if frame_used >= 0 {
+                pool.checked_add(u64::try_from(frame_used).map_err(|_| InternalError::Overflow)?)
+                    .ok_or(InternalError::Overflow)?
+            } else {
+                // Net-negative: the call's inline refunds exceeded its own charges,
+                // so the surplus already credited to the pool belongs to an
+                // ancestor's charge and is taken back out here.
+                pool.saturating_sub(
+                    u64::try_from(frame_used.saturating_neg())
+                        .map_err(|_| InternalError::Overflow)?,
+                )
+            };
+            self.frame_state_gas_pool = Some(restored);
+            self.state_gas_used = entry;
+            self.current_call_frame.frame_state_gas_spilled = 0;
+            return Ok(());
+        }
         let spilled = self.current_call_frame.frame_state_gas_spilled;
         // LIFO invariant: any remaining spill is undrained own-charge, so it
         // implies frame_used >= 0. A net-negative frame_used only arises after
@@ -1636,14 +1793,14 @@ impl<'a> VM<'a> {
         if frame_tx.max_priority_fee_per_gas > frame_tx.max_fee_per_gas {
             return Err(VMError::TxValidation(
                 crate::errors::TxValidationError::PriorityGreaterThanMaxFeePerGas {
-                    priority_fee: U256::from(frame_tx.max_priority_fee_per_gas),
-                    max_fee_per_gas: U256::from(frame_tx.max_fee_per_gas),
+                    priority_fee: frame_tx.max_priority_fee_per_gas,
+                    max_fee_per_gas: frame_tx.max_fee_per_gas,
                 },
             ));
         }
 
         // Check max_fee >= base_fee
-        if U256::from(frame_tx.max_fee_per_gas) < self.env.base_fee_per_gas {
+        if frame_tx.max_fee_per_gas < self.env.base_fee_per_gas {
             return Err(VMError::TxValidation(
                 crate::errors::TxValidationError::InsufficientMaxFeePerGas,
             ));
@@ -1680,6 +1837,7 @@ impl<'a> VM<'a> {
             approve_called_in_current_frame: false,
             max_gas,
             blob_base_fee: self.env.base_blob_fee_per_gas,
+            outstanding_charge_owners: FxHashMap::default(),
         });
 
         // EIP-8141: every outer signature must validate
@@ -1716,8 +1874,8 @@ impl<'a> VM<'a> {
         let sum_frame_gas_limits: u64 = frame_tx
             .frames
             .iter()
-            .map(|f| f.gas_limit)
-            .fold(0u64, |acc, g| acc.saturating_add(g));
+            .map(|f| f.gas_limits.execution.saturating_add(f.gas_limits.state))
+            .fold(0u64, |acc, g: u64| acc.saturating_add(g));
         // The non-frame part of `standard_gas_limit`, not of `max_gas`: when the
         // calldata floor dominates, the extra reservation is not intrinsic gas and
         // is applied once at settlement instead.
@@ -1732,7 +1890,7 @@ impl<'a> VM<'a> {
         let mut in_atomic_batch = false;
         let mut batch_start_idx: usize = 0;
         let mut batch_logs_start: usize = 0;
-        let mut batch_approval_snapshot: (bool, Option<Address>) = (false, None);
+        let mut batch_context_snapshot: Option<FrameContextSnapshot> = None;
         let mut batch_bal_checkpoint: Option<BlockAccessListCheckpoint> = None;
         // EIP-8037: snapshot the shared `state_gas_used` at batch entry so a batch
         // revert (which unrolls every in-batch frame's state) also drops the state
@@ -1767,9 +1925,12 @@ impl<'a> VM<'a> {
                         InternalError::Custom("missing frame tx context".to_string()),
                     ))?;
                     ctx.current_frame_index = frame_idx;
+                    // A frame of a failed atomic batch never executes; its
+                    // zero-usage receipt makes its allotted gas -- in BOTH
+                    // dimensions -- count as unused at settlement.
                     ctx.frame_results.push((
                         ethrex_common::types::FRAME_RECEIPT_STATUS_SKIPPED,
-                        0,
+                        GasUsed::default(),
                         Vec::new(),
                     ));
                     if frame_idx == end_idx {
@@ -1814,14 +1975,14 @@ impl<'a> VM<'a> {
                 batch_start_idx = frame_idx;
                 batch_logs_start = all_logs.len();
                 state_gas_used_at_batch_entry = self.state_gas_used;
-                // Snapshot approvals at batch entry: a batch revert must also
-                // roll back approvals granted inside the batch (their balance
-                // and nonce effects are reverted with the substate).
-                batch_approval_snapshot = self
+                // Snapshot the frame context at batch entry: a batch revert must roll
+                // back the approvals granted inside the batch (their balance and nonce
+                // effects are reverted with the substate), the receipts its frames
+                // refilled, and the outstanding-charge ownership map.
+                batch_context_snapshot = self
                     .frame_tx_context
                     .as_ref()
-                    .map(|c| c.approval_snapshot())
-                    .unwrap_or((false, None));
+                    .map(|c| c.snapshot(self.frame_state_gas_pool));
             }
 
             let ctx =
@@ -1832,6 +1993,18 @@ impl<'a> VM<'a> {
                     )))?;
             ctx.current_frame_index = frame_idx;
             ctx.approve_called_in_current_frame = false;
+            // EIP-8141: checkpoint at frame entry, before any charge. A failing
+            // frame's state gas restores to here -- which also undoes any edits it
+            // made to earlier frames' receipts through a cross-frame refill, and any
+            // approval its nested calls recorded.
+            let frame_entry_snapshot = ctx.snapshot(None);
+
+            // EIP-8141: seed the frame's state gas pool from its declared budget.
+            // Each frame runs against fresh pools holding its own budgets; unused
+            // gas in either dimension is not available to later frames.
+            let state_budget = frame.gas_limits.state;
+            let execution_budget = frame.gas_limits.execution;
+            self.frame_state_gas_pool = Some(state_budget);
 
             let target = frame.target.unwrap_or(sender);
 
@@ -1855,6 +2028,49 @@ impl<'a> VM<'a> {
             // Set env.origin for this frame (ORIGIN opcode reads this)
             self.env.origin = caller;
 
+            // Log count of the scope this frame's backup will be committed into.
+            // The CallFrame branch below relies on `run_execution` having already
+            // committed the frame (merging its logs up into this scope), then
+            // slices `[substate_logs_before..]` to recover exactly this frame's
+            // logs without re-committing.
+            let substate_logs_before = self.substate.logs_len();
+
+            // Push substate backup for per-frame state isolation. Everything the
+            // frame warms — including its own target, charged just below — lives
+            // inside this backup, so a failed frame contributes no warmth to later
+            // frames. The EIP's Execution section shares the warm/cold journal across
+            // frames; EELS merges a frame's accessed set into that journal only
+            // when the frame succeeds, which is what reverting this backup does.
+            self.substate.push_backup();
+
+            // EIP-8141, Rationale: "Cold/warm access costs for the frame's target
+            // account are charged within the frame's own `gas_limit` through the
+            // normal EVM warm/cold accounting, not through the per-frame cost."
+            // The frame is entered from ENTRY_POINT (or tx.sender), so nothing else
+            // pays for reaching the target; without this a frame reads its target for
+            // free and every later frame re-pays the cold price for an account an
+            // earlier frame already touched.
+            //
+            // The charge is taken for EVERY frame, before dispatch: resolving the
+            // target's code is how the protocol dispatches the frame, so a frame
+            // running the protocol default code pays it too — and its target is warmed
+            // for later frames on success, which is what keeps a payer warm.
+            //
+            // Priced without warming: the target joins the frame's access set only
+            // once the frame is known to afford the charge. A frame that cannot pay
+            // halts before reading the target at all, so nothing about that target
+            // reaches the EIP-7928 access list (or an execution witness) — which is
+            // what the block's own access list commits to.
+            let target_access = if self.substate.is_address_accessed(&target) {
+                crate::gas_cost::WARM_ADDRESS_ACCESS_COST
+            } else {
+                crate::gas_cost::cold_account_access_cost(self.env.config.fork)
+            };
+            // The target's access alone exceeding the frame's execution budget halts
+            // the frame exceptionally, consuming the budget whole. Nothing else has
+            // been charged at that point, so there is nothing to restore.
+            let target_access_unaffordable = target_access > execution_budget;
+
             // Resolve any EIP-7702 delegation at the resolved target. For a non-delegated
             // target this is equivalent to `db.get_account_code(target)`; for a delegated
             // target it follows the 0xef0100 || addr indicator and returns the delegatee's
@@ -1864,35 +2080,95 @@ impl<'a> VM<'a> {
             // CallFrame receives the resolved `code_address`. Mirrors the pattern used at
             // top-level tx entry in default_hook::set_bytecode_and_code_address.
             //
-            // access_cost is intentionally discarded: this frame entry is analogous to a
-            // top-level tx entry (a call from 0xaa / tx.sender, not a CALL opcode), and
-            // default_hook.rs drops the same cost there. EIP-8141 §Execution is silent on
-            // billing the 7702 access cost for `resolved_target`, so we keep frame-entry
-            // behavior consistent with tx-entry behavior.
-            let (is_delegation_7702, _access_cost, code_address, bytecode) =
-                crate::utils::eip7702_get_code(
+            // Following the indicator is a second account access, and it is billed to
+            // the frame alongside the target access above. Peek first: the delegate is
+            // only read once the frame is known to afford that access, so a frame that
+            // cannot pay halts before touching it. Reading it earlier would file the
+            // delegate in the EIP-7928 access list (and in execution witnesses) for a
+            // frame that never resolved it, which the receipts alone cannot contradict
+            // -- an unaffordable designation and a failure inside the delegate's code
+            // both forfeit the whole frame gas limit.
+            let (target_bytecode, delegation) = if target_access_unaffordable {
+                (Code::default(), None)
+            } else {
+                crate::utils::eip7702_peek_delegation(
                     self.db,
-                    &mut self.substate,
+                    &self.substate,
                     target,
                     self.env.config.fork,
-                )?;
+                )?
+            };
+            let delegation_access_cost = delegation.map_or(0, |(_, cost)| cost);
 
-            // Mirror default_hook::set_bytecode_and_code_address: when delegation was
-            // followed, record the delegatee (code_address) as touched in BAL so EIP-7928
-            // reconstructors see the cross-address read.
-            if is_delegation_7702 && let Some(recorder) = self.db.bal_recorder.as_mut() {
-                recorder.record_touched_address(code_address);
+            // Entering a frame reads its target's account (code, and the balance the
+            // warm/cold charge is priced against), so EIP-7928 reconstructors must see
+            // the touch. Recorded before the frame runs and kept even when it halts
+            // later: the read happened regardless of what the frame did afterwards.
+            if !target_access_unaffordable {
+                self.substate.add_accessed_address(target);
+                if let Some(recorder) = self.db.bal_recorder.as_mut() {
+                    recorder.record_touched_address(target);
+                }
             }
 
-            // Log count of the scope this frame's backup will be committed into.
-            // The CallFrame branch below relies on `run_execution` having already
-            // committed the frame (merging its logs up into this scope), then
-            // slices `[substate_logs_before..]` to recover exactly this frame's
-            // logs without re-committing.
-            let substate_logs_before = self.substate.logs_len();
+            // EIP-8141, Execution: a VERIFY frame whose resolved target has no code
+            // runs the protocol default code *instead of* an EVM — unless that target
+            // is a precompile, which dispatches in EVERY mode, VERIFY included. Every
+            // other frame (a SENDER or DEFAULT frame to a codeless account runs an EVM
+            // over empty code) is entered normally.
+            let runs_default_verify_code = frame.execution_mode() == FrameMode::Verify
+                && target_bytecode.is_empty()
+                && delegation.is_none()
+                && !crate::precompiles::is_precompile(&target, self.env.config.fork, self.vm_type);
 
-            // Push substate backup for per-frame state isolation
-            self.substate.push_backup();
+            // The delegation resolve is a second account access, billed to the frame's
+            // execution budget alongside the target's. EIP-8037, via EELS
+            // `charge_value_transfer_to_non_alive_account`: a frame whose value
+            // transfer revives a dead target also pays the NEW_ACCOUNT cost at entry —
+            // and that charge belongs to the STATE dimension, drawn from the frame's
+            // own state pool, which execution gas can never fund.
+            let entry_state_gas = if !runs_default_verify_code
+                && !target_access_unaffordable
+                && self.env.config.fork >= Fork::Amsterdam
+                && !frame.value.is_zero()
+                && self.db.get_account(target)?.is_empty()
+            {
+                self.state_gas_new_account
+            } else {
+                0
+            };
+
+            let frame_entry_gas = if runs_default_verify_code {
+                target_access
+            } else {
+                target_access.saturating_add(delegation_access_cost)
+            };
+
+            // The entry charges come out of the frame's own budgets, so a frame that
+            // cannot afford to be entered fails without executing, forfeiting its
+            // whole execution budget (an exceptional halt, not a revert). Either
+            // dimension can be the one that cannot pay.
+            let frame_entry_unaffordable =
+                frame_entry_gas > execution_budget || entry_state_gas > state_budget;
+            let frame_gas_after_entry = execution_budget.saturating_sub(frame_entry_gas);
+
+            // Now that the frame can pay for it, follow the designation: warm the
+            // delegate, read its code, and record the cross-address read for EIP-7928.
+            // EIP-8141 requires a delegated target to execute the delegatee's code while
+            // ADDRESS and storage stay tied to the delegator, which is why `to` below
+            // stays `target` and only `code_address` moves.
+            let (code_address, bytecode) = match delegation {
+                Some((auth_address, _)) if !frame_entry_unaffordable => {
+                    self.substate.add_accessed_address(auth_address);
+                    if let Some(recorder) = self.db.bal_recorder.as_mut() {
+                        recorder.record_touched_address(auth_address);
+                    }
+                    let code = self.db.get_account_code(auth_address)?.clone();
+                    (auth_address, code)
+                }
+                Some((auth_address, _)) => (auth_address, target_bytecode),
+                None => (target, target_bytecode),
+            };
 
             // EIP-8141 top-level value transfer: the outer
             // frame call owns CALLVALUE delivery. We only CHECK affordability
@@ -1937,16 +2213,53 @@ impl<'a> VM<'a> {
             let state_gas_reservoir_at_frame_entry = self.state_gas_reservoir;
             let state_gas_spill_at_frame_entry = self.state_gas_spill;
 
-            let (frame_success, frame_gas_used, frame_logs) = if value_transfer_reverted {
+            // The entry NEW_ACCOUNT charge belongs to the state dimension, so it is
+            // drawn from the frame's own state pool. Recorded after the baseline
+            // above: a frame that fails rolls back to that baseline and creates no
+            // account, so it contributes none of it.
+            if entry_state_gas != 0
+                && !value_transfer_reverted
+                && !frame_entry_unaffordable
+                && !target_access_unaffordable
+            {
+                self.increase_state_gas(entry_state_gas)?;
+            }
+
+            // EIP-7928: capture the access-list recorder before the frame runs. A
+            // reverted frame's state changes are rolled back, so its recorded
+            // changes must be rolled back too — otherwise the builder emits an
+            // access list that disagrees with the state the block actually
+            // contains, and the block fails its own BAL validation on
+            // re-execution. Because the builder rebuilds the same transaction
+            // every slot, a single such frame halts block production.
+            let mut frame_bal_checkpoint = self.db.bal_recorder.as_ref().map(|r| r.checkpoint());
+
+            let (frame_success, frame_gas_used, frame_logs) = if target_access_unaffordable {
+                // The target's access alone exceeded the frame's execution budget:
+                // the frame halts exceptionally, consuming the budget whole.
                 self.substate.revert_backup();
                 self.restore_cache_state()?;
-                (false, frame.gas_limit, Vec::new())
-            } else if bytecode.is_empty() && !is_delegation_7702 {
-                // Default code runs only when the target has NEITHER code NOR a delegation
-                // indicator (EIP-8141 §Execution). After eip7702_get_code,
-                // bytecode is the delegatee's code when delegated, so a delegation to an
-                // empty delegatee still falls into the CallFrame branch below and returns
-                // success without executing anything — NOT into the default-code path.
+                (false, execution_budget, Vec::new())
+            } else if value_transfer_reverted {
+                // A frame whose sender cannot fund its `value` reverts as an ordinary
+                // CALL would, consuming the gas charged so far -- the target's access,
+                // which the frame paid before the balance was checked.
+                self.substate.revert_backup();
+                self.restore_cache_state()?;
+                (false, target_access, Vec::new())
+            } else if frame_entry_unaffordable {
+                self.substate.revert_backup();
+                self.restore_cache_state()?;
+                (false, execution_budget, Vec::new())
+            } else if runs_default_verify_code {
+                // EIP-8141, Execution: the protocol default code stands in for an EVM
+                // only for a VERIFY frame whose resolved target has no code. Every other
+                // frame runs a top-level call, which is what dispatches a precompile by
+                // address and follows a delegation indicator — a SENDER or DEFAULT frame
+                // to a codeless account takes the CallFrame branch below and returns
+                // success without executing anything, and one targeting a precompile runs
+                // it. Routing those through the default code instead would silently skip
+                // the precompile and report the frame as free.
                 // current_call_frame is the OUTER frame here; its backup is the
                 // one this branch's failure path restores, so the deferred
                 // transfer is correctly undone on a default-code revert.
@@ -1964,17 +2277,21 @@ impl<'a> VM<'a> {
                             let mut this_frame_logs = self.substate.current_logs();
                             this_frame_logs.extend(logs);
                             self.substate.commit_backup();
-                            (true, gas_used, this_frame_logs)
+                            (
+                                true,
+                                frame_entry_gas.saturating_add(gas_used),
+                                this_frame_logs,
+                            )
                         } else {
                             self.substate.revert_backup();
                             self.restore_cache_state()?;
-                            (false, gas_used, Vec::new())
+                            (false, frame_entry_gas.saturating_add(gas_used), Vec::new())
                         }
                     }
                     Err(_) => {
                         self.substate.revert_backup();
                         self.restore_cache_state()?;
-                        (false, frame.gas_limit, Vec::new())
+                        (false, execution_budget, Vec::new())
                     }
                 }
             } else {
@@ -1988,12 +2305,12 @@ impl<'a> VM<'a> {
                     caller,                                    // msg_sender
                     target,                                    // to (delegator; ADDRESS/storage)
                     code_address,                              // code_address (delegatee when 7702)
-                    bytecode,           // bytecode (delegatee's code when 7702)
-                    frame.value,        // msg_value -- CALLVALUE
-                    frame.data.clone(), // calldata
-                    is_static,          // is_static
-                    frame.gas_limit,    // gas_limit
-                    0,                  // depth
+                    bytecode,              // bytecode (delegatee's code when 7702)
+                    frame.value,           // msg_value -- CALLVALUE
+                    frame.data.clone(),    // calldata
+                    is_static,             // is_static
+                    frame_gas_after_entry, // gas_limit (entry charges already taken)
+                    0,                     // depth
                     false, // should_transfer_value (do_frame_value_transfer! handles it)
                     false, // is_create
                     0,     // ret_offset
@@ -2031,13 +2348,17 @@ impl<'a> VM<'a> {
                             // logs, which would duplicate them into frame_receipts[i]).
                             let mut merged_logs = self.substate.current_logs();
                             let this_frame_logs = merged_logs.split_off(substate_logs_before);
-                            (true, gas_used, this_frame_logs)
+                            (
+                                true,
+                                frame_entry_gas.saturating_add(gas_used),
+                                this_frame_logs,
+                            )
                         } else {
                             // A normal EVM revert reaches `handle_state_backup` inside
                             // `run_execution`, which already reverted the backup and
                             // restored the cache for this frame; repeating it here would
                             // revert an extra level.
-                            (false, gas_used, Vec::new())
+                            (false, frame_entry_gas.saturating_add(gas_used), Vec::new())
                         }
                     }
                     Err(_e) => {
@@ -2046,7 +2367,7 @@ impl<'a> VM<'a> {
                         // must be reverted (and the cache restored) here.
                         self.substate.revert_backup();
                         self.restore_cache_state()?;
-                        (false, frame.gas_limit, Vec::new())
+                        (false, execution_budget, Vec::new())
                     }
                 };
 
@@ -2078,27 +2399,58 @@ impl<'a> VM<'a> {
                 result
             };
 
-            // EIP-8037: a failed frame's state changes were reverted above, so it
-            // creates no state and must contribute zero state gas. Roll the shared
-            // `state_gas_used` back to this frame's entry value (the cache/substate
-            // were already restored in the failure arms). Successful frames keep
-            // their accumulated state gas.
+            // EIP-8141: the frame's state usage is its declared budget less what
+            // remained in its pool at frame exit. A failing frame's state gas — the
+            // frame-entry charge included — rolls back to the frame-entry
+            // checkpoint, so its receipt reports zero state gas.
+            let frame_state_gas_used = if frame_success {
+                state_budget.saturating_sub(self.frame_state_gas_pool.unwrap_or(state_budget))
+            } else {
+                0
+            };
             if !frame_success {
+                // A failed frame's state changes were reverted above, so it creates no
+                // state. Roll the shared counter back to this frame's entry value (the
+                // cache/substate were already restored in the failure arms), and
+                // restore the frame context: the receipts a cross-frame refill may
+                // have edited, the ownership map, and any approval a nested call
+                // recorded all roll back with the state.
                 self.state_gas_used = state_gas_used_at_frame_entry;
+                let ctx = self.frame_tx_context.as_mut().ok_or(VMError::Internal(
+                    InternalError::Custom("missing frame tx context".to_string()),
+                ))?;
+                ctx.restore(frame_entry_snapshot);
+                // EIP-7928: drop the reverted frame's recorded changes. `restore`
+                // re-files a freshly-written slot as a read and leaves
+                // `touched_addresses` alone, so every access the frame made is
+                // still reported — only the reverted changes go. This mirrors the
+                // atomic-batch unroll below; a frame that reverts on its own needs
+                // the same reconciliation, including the case where a slot was
+                // written and then read inside the frame (the write suppresses the
+                // read record, so dropping the write without re-filing it would
+                // leave the slot in neither list).
+                if let Some(checkpoint) = frame_bal_checkpoint.take()
+                    && let Some(recorder) = self.db.bal_recorder.as_mut()
+                {
+                    recorder.restore(checkpoint);
+                }
             }
-            // EIP-8037: frames are gas-isolated, so the state-gas reservoir/spill
-            // must not leak across the frame boundary. A reservoir credit from an
-            // inline refund inside this frame (or a reverted frame's inflated
-            // reservoir) would otherwise subsidize the next frame's state charges
-            // (drawn before any spill to gas_remaining). Reset both to this frame's
-            // entry value unconditionally — a successful frame already folded its
-            // inline refund into `state_gas_used`, so the leftover reservoir credit
-            // is spent and must be dropped.
+            // EIP-8037: frames are gas-isolated, so the reservoir/spill of the
+            // single-gas-field model must not leak across the frame boundary. A frame
+            // transaction never uses them (its state gas comes from the per-frame
+            // pool), but resetting them keeps the two models from interfering.
             self.state_gas_reservoir = state_gas_reservoir_at_frame_entry;
             self.state_gas_spill = state_gas_spill_at_frame_entry;
+            // The pool belongs to the frame that just ended; the next frame seeds its
+            // own, and code outside a frame must not see one.
+            self.frame_state_gas_pool = None;
 
+            let frame_gas = GasUsed {
+                execution: frame_gas_used,
+                state: frame_state_gas_used,
+            };
             total_gas_used = total_gas_used
-                .checked_add(frame_gas_used)
+                .checked_add(frame_gas.total())
                 .ok_or(VMError::Internal(InternalError::Overflow))?;
             all_logs.extend(frame_logs.clone());
 
@@ -2114,8 +2466,7 @@ impl<'a> VM<'a> {
             } else {
                 ethrex_common::types::FRAME_RECEIPT_STATUS_FAILURE
             };
-            ctx.frame_results
-                .push((status_code, frame_gas_used, frame_logs));
+            ctx.frame_results.push((status_code, frame_gas, frame_logs));
 
             // Atomic batch: if a frame in the batch reverted, revert the
             // batch-level snapshot and skip remaining frames in the batch.
@@ -2135,25 +2486,43 @@ impl<'a> VM<'a> {
                 // state — drop the state gas accumulated since batch entry.
                 self.state_gas_used = state_gas_used_at_batch_entry;
 
-                // EIP-8141: frames that executed before the failure retain their
-                // execution status and gas used; only their logs are discarded,
-                // together with the state changes the unroll drops. `total_gas_used`
-                // therefore stands as executed, and the failing frame keeps the gas
-                // the single-frame path already charged it (actual `gas_used` for a
-                // `REVERT`, the full `gas_limit` for an exceptional halt).
+                // EIP-8141: the receipts of the executed batch frames are re-appended
+                // keeping their status and execution gas, with their logs emptied and
+                // their state gas zeroed. Restoring the frame context first is what
+                // undoes the refills the batch's frames applied to PRE-batch receipts;
+                // re-appending afterwards is the only way to keep the batch frames'
+                // own entries while dropping what the unroll reverses. The execution
+                // gas the batch consumed remains charged, since its receipts keep it —
+                // the failing frame included (actual gas for a `REVERT`, the whole
+                // execution budget for an exceptional halt).
                 let ctx = self.frame_tx_context.as_mut().ok_or(VMError::Internal(
                     InternalError::Custom("missing frame tx context".to_string()),
                 ))?;
-                for result in ctx
+                let executed_batch_receipts: Vec<(u8, GasUsed, Vec<Log>)> = ctx
                     .frame_results
-                    .get_mut(batch_start_idx..=frame_idx)
-                    .into_iter()
-                    .flatten()
-                {
-                    result.2 = Vec::new();
+                    .get(batch_start_idx..)
+                    .unwrap_or_default()
+                    .to_vec();
+                // Also rolls back the approvals granted inside the reverted batch:
+                // their balance and nonce effects were reverted with the substate.
+                let snapshot = batch_context_snapshot.clone().ok_or(VMError::Internal(
+                    InternalError::Custom("missing atomic batch snapshot".to_string()),
+                ))?;
+                let restored_pool = ctx.restore(snapshot);
+                self.frame_state_gas_pool = restored_pool;
+                let ctx = self.frame_tx_context.as_mut().ok_or(VMError::Internal(
+                    InternalError::Custom("missing frame tx context".to_string()),
+                ))?;
+                for (status, gas_used, _) in executed_batch_receipts {
+                    ctx.frame_results.push((
+                        status,
+                        GasUsed {
+                            execution: gas_used.execution,
+                            state: 0,
+                        },
+                        Vec::new(),
+                    ));
                 }
-                // Roll back approvals granted inside the reverted batch.
-                ctx.restore_approvals(batch_approval_snapshot);
                 // Remove only logs from the batch, preserving pre-batch logs
                 all_logs.truncate(batch_logs_start);
 
@@ -2236,23 +2605,51 @@ impl<'a> VM<'a> {
             )))?;
         let payer = ctx.payer_address.unwrap_or(sender);
 
-        // EIP-8141 gas finalization. EIP-3529 storage refunds accumulate into a
-        // single transaction-scoped counter across frames — `substate.refunded_gas`,
-        // which a reverted frame or an unrolled atomic batch drops along with its
-        // state changes — and are applied once here, capped at a fifth of the gas
-        // used before refunds. The EIP-7623 calldata floor then applies to the frame
-        // and signature data: the mandatory costs are always charged, and the data
-        // cost is floored against what execution actually consumed.
-        let mandatory_gas = frame_tx.mandatory_gas();
+        // EIP-8141 gas settlement. Both dimensions settle from the final frame
+        // receipts: each frame's unused gas is its budget less its receipt's usage,
+        // so gas a rollback or a later frame's refill removed from a receipt counts
+        // as unused without further accounting.
+        //
+        // Computed in order: the gas used before refunds, from the settlement anchor
+        // (`standard_gas_limit`, the intrinsic cost plus the frames' budgets in both
+        // dimensions) less the gas not charged at settlement; the EIP-3529 storage
+        // refund, capped at a fifth of the pre-refund usage; and the execution
+        // dimension, as the post-refund usage less the final attributed state gas,
+        // held to the EIP-7623 calldata floor. The floor binds the execution
+        // dimension alone, so a floor-bound transaction pays the floor PLUS its state
+        // gas in full — unlike the single-dimension flow, where the floor caps the
+        // whole transaction.
+        let mut unused_gas: u64 = 0;
+        let mut tx_state_gas: u64 = 0;
+        for (frame, (_, gas_used, _)) in frame_tx.frames.iter().zip(ctx.frame_results.iter()) {
+            unused_gas = unused_gas
+                .saturating_add(
+                    frame
+                        .gas_limits
+                        .execution
+                        .saturating_sub(gas_used.execution),
+                )
+                .saturating_add(frame.gas_limits.state.saturating_sub(gas_used.state));
+            tx_state_gas = tx_state_gas.saturating_add(gas_used.state);
+        }
+        let gas_used_before_refund = frame_tx.standard_gas_limit().saturating_sub(unused_gas);
         let applied_refund = self
             .substate
             .refunded_gas
-            .min(total_gas_used / crate::hooks::default_hook::MAX_REFUND_QUOTIENT);
-        let data_and_execution = total_gas_used
-            .saturating_sub(applied_refund)
-            .saturating_sub(mandatory_gas);
-        let total_gas_used =
-            mandatory_gas.saturating_add(data_and_execution.max(frame_tx.calldata_floor_gas()));
+            .min(gas_used_before_refund / crate::hooks::default_hook::MAX_REFUND_QUOTIENT);
+        let gas_used_after_refund = gas_used_before_refund.saturating_sub(applied_refund);
+        // The refund cap of a state-dominated transaction can exceed its intrinsic
+        // cost plus execution usage, so the subtraction is taken in signed arithmetic
+        // before the floor clamps it.
+        let execution_gas_used = u64::try_from(
+            i128::from(gas_used_after_refund)
+                .saturating_sub(i128::from(tx_state_gas))
+                .max(i128::from(frame_tx.calldata_floor_total())),
+        )
+        .map_err(|_| InternalError::Overflow)?;
+        // The payer pays for exactly the capacity the transaction occupies across
+        // both dimensions.
+        let total_gas_used = execution_gas_used.saturating_add(tx_state_gas);
 
         // Gas refunds: the payer was debited the transaction's `max_cost` at
         // APPROVE (`max_gas` at `max_fee_per_gas`, plus the blob cost already at
@@ -2380,15 +2777,14 @@ impl<'a> VM<'a> {
             TxResult::Success
         };
 
-        // EIP-8037: report the transaction's net state gas (same formula as the
-        // normal-tx path in default_hook). `total_gas_used` already includes the
-        // state gas — it spilled into each frame's gas_remaining, exactly as for any
-        // sub-TX_MAX_GAS_LIMIT transaction whose reservoir is 0 — so reporting
-        // `state_gas_used` here lets the block-level regular/state split
-        // (regular = gas_used - state_gas_used) attribute it to the state dimension
-        // instead of billing the whole amount as regular gas.
-        let state_gas_used =
-            u64::try_from(self.state_gas_used.max(0)).map_err(|_| InternalError::Overflow)?;
+        // EIP-8141: the transaction's state dimension is the frames' final attributed
+        // state gas — the sum of their receipts' state usage, settled above. The
+        // per-frame pools never spill into execution gas, so the shared EIP-8037
+        // counter is no longer the source of truth here: the receipts are, and they
+        // already account for rollbacks and cross-frame refills. The block-level
+        // regular/state split (regular = gas_used - state_gas_used) then bills each
+        // dimension exactly what it occupied.
+        let state_gas_used = tx_state_gas;
 
         // Unused frame gas in GAS UNITS for the report — distinct from the wei
         // refund above (which also returns the max-vs-effective fee delta).
@@ -2466,13 +2862,13 @@ impl<'a> VM<'a> {
         if frame_tx.max_priority_fee_per_gas > frame_tx.max_fee_per_gas {
             return Err(VMError::TxValidation(
                 crate::errors::TxValidationError::PriorityGreaterThanMaxFeePerGas {
-                    priority_fee: U256::from(frame_tx.max_priority_fee_per_gas),
-                    max_fee_per_gas: U256::from(frame_tx.max_fee_per_gas),
+                    priority_fee: frame_tx.max_priority_fee_per_gas,
+                    max_fee_per_gas: frame_tx.max_fee_per_gas,
                 },
             ));
         }
 
-        if U256::from(frame_tx.max_fee_per_gas) < self.env.base_fee_per_gas {
+        if frame_tx.max_fee_per_gas < self.env.base_fee_per_gas {
             return Err(VMError::TxValidation(
                 crate::errors::TxValidationError::InsufficientMaxFeePerGas,
             ));
@@ -2490,6 +2886,7 @@ impl<'a> VM<'a> {
             approve_called_in_current_frame: false,
             max_gas,
             blob_base_fee: self.env.base_blob_fee_per_gas,
+            outstanding_charge_owners: FxHashMap::default(),
         });
 
         if !validate_frame_signatures(
@@ -2619,7 +3016,7 @@ impl<'a> VM<'a> {
             let (frame_success, frame_gas_used) = if value_transfer_reverted {
                 self.substate.revert_backup();
                 self.restore_cache_state()?;
-                (false, frame.gas_limit)
+                (false, frame.gas_limits.execution)
             } else if bytecode.is_empty() && !is_delegation_7702 {
                 // Default-code path (target has neither code nor a delegation).
                 if !frame.value.is_zero() {
@@ -2640,7 +3037,7 @@ impl<'a> VM<'a> {
                     Err(_) => {
                         self.substate.revert_backup();
                         self.restore_cache_state()?;
-                        (false, frame.gas_limit)
+                        (false, frame.gas_limits.execution)
                     }
                 }
             } else {
@@ -2653,7 +3050,7 @@ impl<'a> VM<'a> {
                     frame.value,
                     frame.data.clone(),
                     is_static,
-                    frame.gas_limit,
+                    frame.gas_limits.execution,
                     0,
                     false,
                     false,
@@ -2684,7 +3081,7 @@ impl<'a> VM<'a> {
                     Err(_e) => {
                         self.substate.revert_backup();
                         self.restore_cache_state()?;
-                        (false, frame.gas_limit)
+                        (false, frame.gas_limits.execution)
                     }
                 };
 
@@ -3552,6 +3949,7 @@ impl<'a> VM<'a> {
             preserve_top_level_backup: false,
             state_gas_used: 0,
             state_gas_reservoir,
+            frame_state_gas_pool: None,
             state_gas_reservoir_initial: state_gas_reservoir,
             state_gas_spill: 0,
             cost_per_state_byte: 0,

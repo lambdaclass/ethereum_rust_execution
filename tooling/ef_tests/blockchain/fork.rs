@@ -108,6 +108,15 @@ lazy_static! {
         ..*BPO2_TO_AMSTERDAM_AT_15K_CONFIG
     };
 
+    /// `Bogota` is the pseudo-fork the EIP-8141 fixtures are labelled with:
+    /// Amsterdam plus frame transactions. EELS prototypes the EIP inside its
+    /// Amsterdam module and fills with `--fork Bogota`; ethrex gates frame
+    /// transactions on Hegota, which is the same fork under its ethrex name.
+    pub static ref BOGOTA_CONFIG: ChainConfig = ChainConfig {
+        hegota_time: Some(0),
+        ..*AMSTERDAM_CONFIG
+    };
+
 }
 
 /// Most of the fork variants are just for parsing the tests
@@ -151,6 +160,10 @@ pub enum Fork {
     BPO4ToBPO5AtTime15k,
     BPO2ToAmsterdamAtTime15k,
     Amsterdam,
+    /// EELS's pseudo-fork for EIP-8141 fixtures: Amsterdam + frame transactions.
+    /// Named `Hegota` inside ethrex.
+    #[serde(alias = "Hegota")]
+    Bogota,
 }
 
 impl Fork {
@@ -172,6 +185,7 @@ impl Fork {
             Fork::BPO4ToBPO5AtTime15k => &BPO4_TO_BPO5_AT_15K_CONFIG,
             Fork::BPO2ToAmsterdamAtTime15k => &BPO2_TO_AMSTERDAM_AT_15K_CONFIG,
             Fork::Amsterdam => &AMSTERDAM_CONFIG,
+            Fork::Bogota => &BOGOTA_CONFIG,
             _ => {
                 panic!("Ethrex doesn't support pre-Merge forks: {self:?}")
             }

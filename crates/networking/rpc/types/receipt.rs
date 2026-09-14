@@ -33,12 +33,17 @@ pub struct RpcReceipt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcFrameReceipt {
-    /// EIP-8141 frame status code: 0 = failure, 1 = success, 3 = skipped
+    /// EIP-8141 frame status code: 0 = failure, 1 = success, 2 = skipped
     /// (atomic-batch failure). Serialized as a hex-encoded byte.
     #[serde(with = "serde_utils::u8::hex_str")]
     pub status: u8,
+    /// EIP-8141 exposes a frame's gas usage per dimension: `gasUsed` is the
+    /// execution gas its meter consumed and `stateGasUsed` the state gas
+    /// attributed to it.
     #[serde(with = "serde_utils::u64::hex_str")]
     pub gas_used: u64,
+    #[serde(with = "serde_utils::u64::hex_str")]
+    pub state_gas_used: u64,
     pub logs: Vec<RpcLogInfo>,
 }
 
@@ -46,7 +51,8 @@ impl From<FrameReceipt> for RpcFrameReceipt {
     fn from(fr: FrameReceipt) -> Self {
         Self {
             status: fr.status,
-            gas_used: fr.gas_used,
+            gas_used: fr.gas_used.execution,
+            state_gas_used: fr.gas_used.state,
             logs: fr.logs.into_iter().map(RpcLogInfo::from).collect(),
         }
     }

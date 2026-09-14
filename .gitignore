@@ -41,6 +41,9 @@ jwt.hex
 /tmp
 
 *tests*.tar.gz
+# Partial downloads of the fixture bundles; the Makefile fetches to `.part`
+# first so a failed download cannot truncate the previous bundle.
+*.tar.gz.part
 tooling/ef_tests/state/test.tar.gz
 
 .env

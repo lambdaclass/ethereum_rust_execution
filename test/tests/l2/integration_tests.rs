@@ -2740,8 +2740,11 @@ async fn get_fees_details_l2(
         .unwrap()
         .unwrap();
     let tx_gas_used = tx_receipt.tx_info.gas_used;
-    let max_fee_per_gas = rpc_tx.tx.max_fee_per_gas().unwrap();
-    let max_priority_fee_per_gas: u64 = rpc_tx.tx.max_priority_fee().unwrap();
+    // The shared accessors are `U256` because EIP-8141 bounds a frame
+    // transaction's fee fields at 2**256; the fee arithmetic below is `u64`, and
+    // an L2 EIP-1559 transaction this test signs itself never exceeds that.
+    let max_fee_per_gas = u64::try_from(rpc_tx.tx.max_fee_per_gas().unwrap()).unwrap();
+    let max_priority_fee_per_gas = u64::try_from(rpc_tx.tx.max_priority_fee().unwrap()).unwrap();
     let block_number = tx_receipt.block_info.block_number;
 
     let l1_blob_base_fee_per_gas = get_l1_blob_base_fee_per_gas(l2_client, block_number).await?;

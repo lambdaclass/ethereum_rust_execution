@@ -31,8 +31,8 @@ use ethrex_common::{
     Address, U256,
     types::{
         AccessList, AccountUpdate, Block, BlockHeader, EIP1559Transaction, Fork, FrameReceipt,
-        GWEI_TO_WEI, GenericTransaction, INITIAL_BASE_FEE, Log, Receipt, Transaction, TxKind,
-        Withdrawal, requests::Requests,
+        GWEI_TO_WEI, GasUsed, GenericTransaction, INITIAL_BASE_FEE, Log, Receipt, Transaction,
+        TxKind, Withdrawal, requests::Requests,
     },
 };
 #[cfg(feature = "rayon")]
@@ -115,7 +115,7 @@ pub struct LEVM;
 /// execution report's `frame_results`. Returns `None` when the report carries
 /// no frame results.
 fn frame_receipts_from(
-    frame_results: Option<Vec<(u8, u64, Vec<Log>)>>,
+    frame_results: Option<Vec<(u8, GasUsed, Vec<Log>)>>,
 ) -> Option<Vec<FrameReceipt>> {
     frame_results.map(|results| {
         results
@@ -154,7 +154,8 @@ fn check_gas_limit(
 ///
 /// The full `tx.gas` is used in both dimensions (only the regular dimension is
 /// capped at `TX_MAX_GAS_LIMIT`); intrinsic underfunding is rejected separately
-/// in transaction validation, not here. Mirrors
+/// in transaction validation, not here. A frame transaction (EIP-8141) reserves
+/// exact per-dimension budgets instead -- see the early return below. Mirrors
 /// `src/ethereum/forks/amsterdam/fork.py` `check_transaction` at the
 /// `tests-glamsterdam-devnet@v7.1.0` spec.
 ///
@@ -171,6 +172,31 @@ pub fn check_2d_gas_allowance(
     let tx_gas = tx.gas_limit();
     let regular_available = block_gas_limit.saturating_sub(block_gas_used_regular);
     let state_available = block_gas_limit.saturating_sub(block_gas_used_state);
+
+    // EIP-8141: a frame transaction declares its state budgets explicitly per
+    // frame, so its reservations are exact per dimension instead of the reservoir
+    // model's whole-gas-limit-in-both-dimensions. The execution reservation carries
+    // the calldata floor, which binds the execution dimension; the state
+    // reservation is the frames' total state budget.
+    if let Transaction::FrameTransaction(frame_tx) = tx {
+        let execution_reservation = frame_tx.execution_gas_cap_usage();
+        let state_reservation = frame_tx.total_frame_state_gas();
+        if execution_reservation > regular_available {
+            return Err(EvmError::Transaction(format!(
+                "Gas allowance exceeded: regular dim worst-case {execution_reservation} > \
+                 available {regular_available} (block_gas_used_regular={block_gas_used_regular}, \
+                 block_gas_limit={block_gas_limit})"
+            )));
+        }
+        if state_reservation > state_available {
+            return Err(EvmError::Transaction(format!(
+                "Gas allowance exceeded: state dim worst-case {state_reservation} > \
+                 available {state_available} (block_gas_used_state={block_gas_used_state}, \
+                 block_gas_limit={block_gas_limit})"
+            )));
+        }
+        return Ok(());
+    }
 
     // Regular dim: worst-case regular contribution = full tx.gas, capped at
     // TX_MAX_GAS_LIMIT. The spec uses the full tx gas with no intrinsic
@@ -2988,8 +3014,8 @@ impl LEVM {
             block_excess_blob_gas,
             block_blob_gas_used: block_header.blob_gas_used,
             tx_blob_hashes: tx.blob_versioned_hashes(),
-            tx_max_priority_fee_per_gas: tx.max_priority_fee().map(U256::from),
-            tx_max_fee_per_gas: tx.max_fee_per_gas().map(U256::from),
+            tx_max_priority_fee_per_gas: tx.max_priority_fee(),
+            tx_max_fee_per_gas: tx.max_fee_per_gas(),
             tx_max_fee_per_blob_gas: tx.max_fee_per_blob_gas(),
             tx_nonce: tx.nonce(),
             block_gas_limit: block_header.gas_limit,
@@ -3285,8 +3311,9 @@ impl LEVM {
     /// uses checked_mul/checked_add and halts on overflow. Saturating to
     /// `U256::MAX` here only makes the reservation larger, never smaller.
     fn frame_tx_reservation_ceiling(frame_tx: &ethrex_common::types::FrameTransaction) -> U256 {
-        let gas_cost =
-            U256::from(frame_tx.max_fee_per_gas).saturating_mul(U256::from(frame_tx.max_gas()));
+        let gas_cost = frame_tx
+            .max_fee_per_gas
+            .saturating_mul(U256::from(frame_tx.max_gas()));
         let blob_cost = U256::from(frame_tx.blob_versioned_hashes.len())
             .saturating_mul(U256::from(131072u64))
             .saturating_mul(frame_tx.max_fee_per_blob_gas);
@@ -3809,13 +3836,21 @@ pub fn calculate_gas_price_for_tx(
         fee_per_gas += operator_fee_config.operator_fee_per_gas;
     }
 
-    if fee_per_gas > max_fee_per_gas {
+    if U256::from(fee_per_gas) > max_fee_per_gas {
         return Err(VMError::TxValidation(
             TxValidationError::InsufficientMaxFeePerGas,
         ));
     }
 
-    Ok(min(max_priority_fee + fee_per_gas, max_fee_per_gas).into())
+    // Saturating, not checked: a frame transaction's priority fee is only bounded
+    // by 2**256 (EIP-8141 static constraints), so the sum can leave `U256` where
+    // every other type stays under `u64::MAX`. `U256`'s `Add` panics on overflow.
+    // The result is identical either way -- a sum past `U256::MAX` exceeds
+    // `max_fee_per_gas`, so `min` clamps to the cap exactly as it would have.
+    Ok(min(
+        max_priority_fee.saturating_add(U256::from(fee_per_gas)),
+        max_fee_per_gas,
+    ))
 }
 
 /// When basefee tracking is disabled  (ie. env.disable_base_fee = true; env.disable_block_gas_limit = true;)

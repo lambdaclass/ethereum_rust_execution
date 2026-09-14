@@ -3759,7 +3759,7 @@ impl Blockchain {
         }
 
         // Check priority fee is less or equal than gas fee gap
-        if tx.max_priority_fee().unwrap_or(0) > tx.max_fee_per_gas().unwrap_or(0) {
+        if tx.max_priority_fee().unwrap_or_default() > tx.max_fee_per_gas().unwrap_or_default() {
             return Err(MempoolError::TxTipAboveFeeCapError);
         }
 

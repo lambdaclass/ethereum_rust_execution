@@ -23,7 +23,9 @@ exclude = [
   # Bot-blocked hosts: reachable in a browser, reject or fail automated checks.
   "discord\\.com/channels",
   "ethereum\\.stackexchange\\.com",
+  "grafana\\.com",
   "hive\\.ethpandaops\\.io",
+  "leastauthority\\.com",
 ]
 
 # SUMMARY.md uses intentional mdBook draft chapters (empty links), which

@@ -1,7 +1,9 @@
 .PHONY: build lint test clean run-image build-image clean-vectors \
 		setup-hive test-pattern-default run-hive run-hive-debug clean-hive-logs \
 		load-test-fibonacci load-test-io run-hive-eels-blobs run-hive-eels-amsterdam \
-		run-hive-eels-bal-quick run-hive-build-block bench-rlp zkevm-bench-setup
+		run-hive-eels-bal-quick run-hive-build-block bench-rlp zkevm-bench-setup \
+		patch-hive-frames-fork run-hive-eels-frames run-hive-eels-frames-rlp \
+		run-hive-eels-frames-quick
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -171,6 +173,33 @@ run-hive-eels-amsterdam: build-image setup-hive ## 🧪 Run hive EELS Amsterdam 
 
 run-hive-eels-bal-quick: build-image setup-hive ## 🧪 Run hive EELS quick tests for the Amsterdam EIPs
 	- cd hive && ./hive --client-file $(HIVE_CLIENT_FILE) --client ethrex --sim ethereum/eels/consume-engine --sim.limit ".*(2780|7708|7732|7778|7843|7928|7954|7975|7976|7981|7997|8024|8037|8038|8045|8061|8070|8159|8246|8282).*" --sim.parallelism $(SIM_PARALLELISM) --sim.loglevel $(SIM_LOG_LEVEL) --sim.buildarg fixtures=$(AMSTERDAM_FIXTURES_URL) --sim.buildarg branch=$(AMSTERDAM_FIXTURES_BRANCH)
+
+FRAMES_FIXTURES_URL ?= $(shell cat tooling/ef_tests/.fixtures_url_frames)
+FRAMES_FIXTURES_BRANCH ?= devnets/frames/0
+# The frames release refills the WHOLE suite at Bogota, so the default sweep is
+# every Bogota fixture; `run-hive-eels-frames-quick` narrows it to EIP-8141.
+FRAMES_FORK_PATTERN ?= .*fork_Bogota.*
+FRAMES_QUICK_PATTERN ?= .*8141.*
+
+# Hive's ethrex client definition maps HIVE_<FORK>_TIMESTAMP env vars onto genesis
+# fields, and it stops at Amsterdam -- so the Bogota timestamp EEST sets for these
+# fixtures reaches the client as nothing at all, frame transactions stay pre-fork,
+# and every EIP-8141 test fails while the rest of the Bogota suite passes. Patch
+# the mapper in the clone until it carries the field upstream. `git checkout` first
+# so repeated runs do not stack the same line, mirroring run-hive-build-block.
+patch-hive-frames-fork:
+	cd hive && git checkout -- clients/ethrex/mapper.jq
+	cd hive && sed -i 's/\( *\)"bpo1Time": env.HIVE_BPO1_TIMESTAMP|to_int,/\1"bogotaTime": env.HIVE_BOGOTA_TIMESTAMP|to_int,\n\1"bpo1Time": env.HIVE_BPO1_TIMESTAMP|to_int,/' clients/ethrex/mapper.jq
+	@grep -q bogotaTime hive/clients/ethrex/mapper.jq || { echo "failed to patch hive mapper for the Bogota fork"; exit 1; }
+
+run-hive-eels-frames: build-image setup-hive patch-hive-frames-fork ## 🧪 Run hive EELS frames-devnet Engine tests
+	- cd hive && ./hive --client-file $(HIVE_CLIENT_FILE) --client ethrex --sim ethereum/eels/consume-engine --sim.limit "$(FRAMES_FORK_PATTERN)" --sim.parallelism $(SIM_PARALLELISM) --sim.loglevel $(SIM_LOG_LEVEL) --sim.buildarg fixtures=$(FRAMES_FIXTURES_URL) --sim.buildarg branch=$(FRAMES_FIXTURES_BRANCH)
+
+run-hive-eels-frames-rlp: build-image setup-hive patch-hive-frames-fork ## 🧪 Run hive EELS frames-devnet RLP tests
+	- cd hive && ./hive --client-file $(HIVE_CLIENT_FILE) --client ethrex --sim ethereum/eels/consume-rlp --sim.limit "$(FRAMES_FORK_PATTERN)" --sim.parallelism $(SIM_PARALLELISM) --sim.loglevel $(SIM_LOG_LEVEL) --sim.buildarg fixtures=$(FRAMES_FIXTURES_URL) --sim.buildarg branch=$(FRAMES_FIXTURES_BRANCH)
+
+run-hive-eels-frames-quick: build-image setup-hive patch-hive-frames-fork ## 🧪 Run hive EELS frames-devnet tests for EIP-8141 only
+	- cd hive && ./hive --client-file $(HIVE_CLIENT_FILE) --client ethrex --sim ethereum/eels/consume-engine --sim.limit "$(FRAMES_QUICK_PATTERN)" --sim.parallelism $(SIM_PARALLELISM) --sim.loglevel $(SIM_LOG_LEVEL) --sim.buildarg fixtures=$(FRAMES_FIXTURES_URL) --sim.buildarg branch=$(FRAMES_FIXTURES_BRANCH)
 
 # Block-building simulator (execution-specs PR #2679). Not yet upstream in Hive,
 # so we install the simulator Dockerfile into the hive clone and patch the

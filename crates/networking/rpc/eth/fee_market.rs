@@ -258,9 +258,17 @@ fn calculate_percentiles_for_block(block: Block, percentiles: &[f32]) -> Vec<u64
             Transaction::FeeTokenTransaction(t) => t
                 .max_priority_fee_per_gas
                 .min(t.max_fee_per_gas.saturating_sub(base_fee_per_gas)),
-            Transaction::FrameTransaction(t) => t
-                .max_priority_fee_per_gas
-                .min(t.max_fee_per_gas.saturating_sub(base_fee_per_gas)),
+            // A frame transaction's fee fields are `U256` (EIP-8141 bounds them at
+            // 2**256). The reward reported here is an effective priority fee, which a
+            // payer must actually be able to cover, so clamping to `u64` matches every
+            // other arm and cannot understate a fee anyone paid.
+            Transaction::FrameTransaction(t) => u64::try_from(
+                t.max_priority_fee_per_gas.min(
+                    t.max_fee_per_gas
+                        .saturating_sub(U256::from(base_fee_per_gas)),
+                ),
+            )
+            .unwrap_or(u64::MAX),
         })
         .collect();
 

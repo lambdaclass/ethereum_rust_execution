@@ -10,8 +10,9 @@ use ethrex_common::constants::GAS_PER_BLOB;
 use ethrex_common::types::{
     APPROVE_EXECUTION, APPROVE_EXECUTION_AND_PAYMENT, APPROVE_PAYMENT, Block, BlockBody,
     BlockHeader, ChainConfig, EIP4844Transaction, FRAME_SIG_SCHEME_ARBITRARY,
-    FRAME_SIG_SCHEME_SECP256K1, FRAME_TX_MAX_VERIFY_GAS, Frame, FrameMode, FrameSignature,
-    FrameTransaction, FrameValidationError, PrefixShape, Transaction, frame_tx_expiry_verifier,
+    FRAME_SIG_SCHEME_SECP256K1, FRAME_TX_MAX_VERIFY_GAS, FRAME_TX_MAX_VERIFY_STATE_GAS, Frame,
+    FrameMode, FrameSignature, FrameTransaction, FrameValidationError, GasLimits, PrefixShape,
+    Transaction, frame_tx_expiry_verifier,
 };
 
 /// EIP-4844 `VERSIONED_HASH_VERSION_KZG`. The constant itself lives in a private
@@ -43,13 +44,16 @@ fn frame_tx_with_blobs(n_blobs: usize) -> FrameTransaction {
             mode: FrameMode::Default as u8,
             flags: 0x00,
             target: None,
-            gas_limit: 0,
+            gas_limits: GasLimits {
+                execution: 0,
+                state: 0,
+            },
             value: Default::default(),
             data: Bytes::new(),
         }],
         signatures: vec![],
-        max_priority_fee_per_gas: 0,
-        max_fee_per_gas: 0,
+        max_priority_fee_per_gas: U256::from(0u64),
+        max_fee_per_gas: U256::from(0u64),
         max_fee_per_blob_gas: Default::default(),
         blob_versioned_hashes: (0..n_blobs).map(|_| H256::zero()).collect(),
         ..Default::default()
@@ -126,7 +130,10 @@ fn expiry_verifier_frame() -> Frame {
         mode: FrameMode::Verify as u8,
         flags: 0x00,
         target: Some(frame_tx_expiry_verifier()),
-        gas_limit: 1_000,
+        gas_limits: GasLimits {
+            execution: 1_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::from(vec![0u8; 8]),
     }
@@ -137,7 +144,10 @@ fn self_verify_frame() -> Frame {
         mode: FrameMode::Verify as u8,
         flags: APPROVE_EXECUTION_AND_PAYMENT,
         target: Some(sender_addr()),
-        gas_limit: 10_000,
+        gas_limits: GasLimits {
+            execution: 10_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     }
@@ -148,7 +158,10 @@ fn only_verify_frame() -> Frame {
         mode: FrameMode::Verify as u8,
         flags: APPROVE_EXECUTION,
         target: Some(sender_addr()),
-        gas_limit: 10_000,
+        gas_limits: GasLimits {
+            execution: 10_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     }
@@ -159,7 +172,10 @@ fn pay_frame() -> Frame {
         mode: FrameMode::Verify as u8,
         flags: APPROVE_PAYMENT,
         target: Some(sender_addr()),
-        gas_limit: 10_000,
+        gas_limits: GasLimits {
+            execution: 10_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     }
@@ -170,7 +186,10 @@ fn deploy_frame() -> Frame {
         mode: FrameMode::Default as u8,
         flags: 0x00,
         target: None,
-        gas_limit: 50_000,
+        gas_limits: GasLimits {
+            execution: 50_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::from_static(b"deploy_bytecode"),
     }
@@ -182,8 +201,8 @@ fn base_frame_tx_with_frames(frames: Vec<Frame>) -> FrameTransaction {
         frames,
         chain_id: 1,
         nonce: 42,
-        max_priority_fee_per_gas: 1_000_000_000,
-        max_fee_per_gas: 30_000_000_000,
+        max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+        max_fee_per_gas: U256::from(30_000_000_000u64),
         ..Default::default()
     }
 }
@@ -308,7 +327,10 @@ fn prefix_rejection_unrecognized_shape() {
         mode: FrameMode::Default as u8,
         flags: 0x00,
         target: None,
-        gas_limit: 10_000,
+        gas_limits: GasLimits {
+            execution: 10_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     }]);
@@ -329,7 +351,10 @@ fn prefix_rejection_deploy_not_first() {
             mode: FrameMode::Verify as u8,
             flags: APPROVE_EXECUTION_AND_PAYMENT,
             target: Some(sender_addr()),
-            gas_limit: 5_000,
+            gas_limits: GasLimits {
+                execution: 5_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -397,7 +422,10 @@ fn prefix_rejection_wrong_scope_self_verify() {
         mode: FrameMode::Verify as u8,
         flags: APPROVE_EXECUTION,
         target: Some(sender_addr()),
-        gas_limit: 10_000,
+        gas_limits: GasLimits {
+            execution: 10_000,
+            state: 0,
+        },
         value: U256::zero(),
         data: Bytes::new(),
     }]);
@@ -443,7 +471,7 @@ fn prefix_rejection_gas_budget_exceeded() {
     // Give the self_verify frame a gas_limit that, combined with sig cost,
     // exceeds MAX_VERIFY_GAS (100_000). Sig cost for one SECP256K1 = 2800.
     let mut frame = self_verify_frame();
-    frame.gas_limit = FRAME_TX_MAX_VERIFY_GAS; // 100_000 alone already == limit
+    frame.gas_limits.execution = FRAME_TX_MAX_VERIFY_GAS; // 100_000 alone already == limit
     let mut tx = base_frame_tx_with_frames(vec![frame]);
     // Ensure exactly one SECP256K1 sig so sig cost = 2800.
     tx.signatures = vec![FrameSignature {
@@ -457,6 +485,37 @@ fn prefix_rejection_gas_budget_exceeded() {
     assert!(matches!(
         tx.validate_prefix_structure(&prefix).unwrap_err(),
         FrameValidationError::VerifyGasBudgetExceeded { .. }
+    ));
+}
+
+#[test]
+fn prefix_state_gas_budget_is_capped_independently_of_execution_gas() {
+    // Per EIP-8141 the validation prefix carries two independent caps: its
+    // execution budgets plus the signature cost against MAX_VERIFY_GAS, and its
+    // state budgets against the much larger MAX_VERIFY_STATE_GAS. State gas does
+    // not measure the node's simulation work, so it must not consume the budget
+    // that bounds it.
+    let mut frame = self_verify_frame();
+    // State gas well past MAX_VERIFY_GAS but within MAX_VERIFY_STATE_GAS, and an
+    // execution budget that leaves room for the signature cost: admissible only
+    // because the two dimensions are capped separately.
+    frame.gas_limits.execution = 10_000;
+    frame.gas_limits.state = FRAME_TX_MAX_VERIFY_STATE_GAS;
+    let tx = base_frame_tx_with_frames(vec![frame.clone()]);
+    let prefix = tx.validation_prefix().expect("SelfVerify recognized");
+    assert!(
+        tx.validate_prefix_structure(&prefix).is_ok(),
+        "state gas within its own cap must not be charged against MAX_VERIFY_GAS"
+    );
+
+    // One gas past the state cap is rejected, and as a state-gas overrun.
+    let mut over = frame;
+    over.gas_limits.state = FRAME_TX_MAX_VERIFY_STATE_GAS + 1;
+    let tx = base_frame_tx_with_frames(vec![over]);
+    let prefix = tx.validation_prefix().expect("SelfVerify recognized");
+    assert!(matches!(
+        tx.validate_prefix_structure(&prefix).unwrap_err(),
+        FrameValidationError::VerifyStateGasBudgetExceeded { .. }
     ));
 }
 
@@ -476,7 +535,10 @@ fn make_test_frame_tx() -> FrameTransaction {
                 mode: FrameMode::Verify as u8,
                 flags: 0x03, // APPROVE_EXECUTION_AND_PAYMENT
                 target: Some(Address::from_low_u64_be(0xABCD)),
-                gas_limit: 100_000,
+                gas_limits: GasLimits {
+                    execution: 100_000,
+                    state: 0,
+                },
                 value: U256::zero(),
                 data: Bytes::from_static(b"verify_data"),
             },
@@ -484,7 +546,10 @@ fn make_test_frame_tx() -> FrameTransaction {
                 mode: FrameMode::Sender as u8,
                 flags: 0x00,
                 target: Some(Address::from_low_u64_be(0x1234)),
-                gas_limit: 200_000,
+                gas_limits: GasLimits {
+                    execution: 200_000,
+                    state: 0,
+                },
                 value: U256::zero(),
                 data: Bytes::from_static(b"call_data"),
             },
@@ -495,8 +560,8 @@ fn make_test_frame_tx() -> FrameTransaction {
             msg: Bytes::new(),
             signature: Bytes::from(vec![0u8; 65]),
         }],
-        max_priority_fee_per_gas: 1_000_000_000,
-        max_fee_per_gas: 30_000_000_000,
+        max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+        max_fee_per_gas: U256::from(30_000_000_000u64),
         max_fee_per_blob_gas: U256::zero(),
         blob_versioned_hashes: vec![],
         ..Default::default()
@@ -511,7 +576,10 @@ fn atomic_batch_flag_on_verify_frame_is_invalid() {
             mode: FrameMode::Verify as u8,
             flags: 0x04 | 0x03, // atomic batch + scope bits
             target: None,
-            gas_limit: 21_000,
+            gas_limits: GasLimits {
+                execution: 21_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -519,7 +587,10 @@ fn atomic_batch_flag_on_verify_frame_is_invalid() {
             mode: FrameMode::Sender as u8,
             flags: 0x00,
             target: Some(Address::from_low_u64_be(0xCAFE)),
-            gas_limit: 21_000,
+            gas_limits: GasLimits {
+                execution: 21_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -541,7 +612,10 @@ fn atomic_batch_followed_by_verify_frame_is_invalid() {
             mode: FrameMode::Sender as u8,
             flags: 0x04, // atomic batch
             target: Some(Address::from_low_u64_be(0xB0B)),
-            gas_limit: 21_000,
+            gas_limits: GasLimits {
+                execution: 21_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -549,7 +623,10 @@ fn atomic_batch_followed_by_verify_frame_is_invalid() {
             mode: FrameMode::Verify as u8,
             flags: 0x03,
             target: None,
-            gas_limit: 21_000,
+            gas_limits: GasLimits {
+                execution: 21_000,
+                state: 0,
+            },
             value: U256::zero(),
             data: Bytes::new(),
         },
@@ -632,14 +709,14 @@ fn max_gas_takes_the_calldata_floor_when_it_exceeds_the_standard_limit() {
     tx.signatures.clear();
     tx.frames[0].data = Bytes::from(vec![0xAAu8; 64]);
     tx.frames[1].data = Bytes::new();
-    tx.frames[0].gas_limit = 100;
-    tx.frames[1].gas_limit = 100;
+    tx.frames[0].gas_limits.execution = 100;
+    tx.frames[1].gas_limits.execution = 100;
     assert!(tx.calldata_floor_total() > tx.standard_gas_limit());
     assert_eq!(tx.max_gas(), tx.calldata_floor_total());
     assert!(tx.validate_static_constraints().is_ok());
 
     // With enough frame gas to outweigh the floor, `max_gas` is the standard limit.
-    tx.frames[1].gas_limit = 100_000;
+    tx.frames[1].gas_limits.execution = 100_000;
     assert!(tx.standard_gas_limit() > tx.calldata_floor_total());
     assert_eq!(tx.max_gas(), tx.standard_gas_limit());
     assert!(tx.validate_static_constraints().is_ok());

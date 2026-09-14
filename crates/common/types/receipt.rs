@@ -18,11 +18,49 @@ pub const FRAME_RECEIPT_STATUS_FAILURE: u8 = 0;
 pub const FRAME_RECEIPT_STATUS_SUCCESS: u8 = 1;
 pub const FRAME_RECEIPT_STATUS_SKIPPED: u8 = 2;
 
+/// A frame's gas usage, one entry per gas dimension of EIP-8037 (EIP-8141).
+/// Encoded as the nested two-element list `[execution, state]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GasUsed {
+    /// Execution gas the frame's meter consumed.
+    pub execution: u64,
+    /// State gas attributed to the frame: its declared budget less what remained
+    /// in its pool at frame exit. Not final until the transaction ends — a later
+    /// frame's cross-frame refill lowers the owning frame's entry in place, and an
+    /// atomic-batch unroll zeroes the state gas of the frames it unrolls.
+    pub state: u64,
+}
+
+impl GasUsed {
+    /// The frame's total gas usage across both dimensions.
+    pub fn total(&self) -> u64 {
+        self.execution.saturating_add(self.state)
+    }
+}
+
+impl RLPEncode for GasUsed {
+    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+        Encoder::new(buf)
+            .encode_field(&self.execution)
+            .encode_field(&self.state)
+            .finish();
+    }
+}
+
+impl RLPDecode for GasUsed {
+    fn decode_unfinished(rlp: &[u8]) -> Result<(Self, &[u8]), RLPDecodeError> {
+        let decoder = Decoder::new(rlp)?;
+        let (execution, decoder) = decoder.decode_field("execution")?;
+        let (state, decoder) = decoder.decode_field("state")?;
+        Ok((GasUsed { execution, state }, decoder.finish()?))
+    }
+}
+
 /// Per-frame execution result within a frame transaction (EIP-8141)
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FrameReceipt {
     pub status: u8,
-    pub gas_used: u64,
+    pub gas_used: GasUsed,
     pub logs: Vec<Log>,
 }
 
@@ -771,7 +809,10 @@ mod test {
     fn test_frame_receipt_rlp_roundtrip() {
         let fr = FrameReceipt {
             status: FRAME_RECEIPT_STATUS_SUCCESS,
-            gas_used: 21000,
+            gas_used: GasUsed {
+                execution: 21000,
+                state: 0,
+            },
             logs: vec![Log {
                 address: Address::random(),
                 topics: vec![],
@@ -785,10 +826,14 @@ mod test {
 
     #[test]
     fn test_frame_receipt_skipped_status_rlp_roundtrip() {
-        // Spec line 137: status code 0x3 marks frames skipped by a failed atomic batch.
+        // EIP-8141 `FrameStatus.SKIPPED` is 2, and marks only frames that never
+        // ran because an earlier frame of their atomic batch failed.
         let fr = FrameReceipt {
             status: FRAME_RECEIPT_STATUS_SKIPPED,
-            gas_used: 0,
+            gas_used: GasUsed {
+                execution: 0,
+                state: 0,
+            },
             logs: vec![],
         };
         let encoded = fr.encode_to_vec();
@@ -811,12 +856,18 @@ mod test {
             frame_receipts: Some(vec![
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_SUCCESS,
-                    gas_used: 100000,
+                    gas_used: GasUsed {
+                        execution: 100000,
+                        state: 0,
+                    },
                     logs: vec![],
                 },
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_SUCCESS,
-                    gas_used: 200000,
+                    gas_used: GasUsed {
+                        execution: 200000,
+                        state: 0,
+                    },
                     logs: vec![Log {
                         address: Address::from_low_u64_be(0xbeef),
                         topics: vec![],
@@ -846,12 +897,18 @@ mod test {
             frame_receipts: Some(vec![
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_SUCCESS,
-                    gas_used: 50000,
+                    gas_used: GasUsed {
+                        execution: 50000,
+                        state: 0,
+                    },
                     logs: vec![],
                 },
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_FAILURE,
-                    gas_used: 50000,
+                    gas_used: GasUsed {
+                        execution: 50000,
+                        state: 0,
+                    },
                     logs: vec![],
                 },
             ]),
@@ -874,12 +931,18 @@ mod test {
             frame_receipts: Some(vec![
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_SUCCESS,
-                    gas_used: 50000,
+                    gas_used: GasUsed {
+                        execution: 50000,
+                        state: 0,
+                    },
                     logs: vec![],
                 },
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_SKIPPED,
-                    gas_used: 0,
+                    gas_used: GasUsed {
+                        execution: 0,
+                        state: 0,
+                    },
                     logs: vec![],
                 },
             ]),
@@ -905,12 +968,18 @@ mod test {
             frame_receipts: Some(vec![
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_FAILURE,
-                    gas_used: 1000,
+                    gas_used: GasUsed {
+                        execution: 1000,
+                        state: 0,
+                    },
                     logs: vec![],
                 }, // a DEFAULT frame failed
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_SUCCESS,
-                    gas_used: 2000,
+                    gas_used: GasUsed {
+                        execution: 2000,
+                        state: 0,
+                    },
                     logs: vec![log],
                 },
             ]),
@@ -929,6 +998,37 @@ mod test {
         assert_eq!(r.encode_storage(), r.encode_inner());
     }
 
+    /// Golden byte vector for the EIP-8141 two-dimensional `gas_used`. Every other
+    /// test in this file builds its expectation with the same encoder, so none of
+    /// them would notice the nested `[execution, state]` list flattening back to a
+    /// scalar; only the spec-test fixtures would, through the receipts root. This
+    /// pins the layout without them.
+    #[test]
+    fn frame_receipt_gas_used_encodes_as_a_nested_pair() {
+        // [21000, 0] -> c4 82 52 08 80
+        assert_eq!(
+            GasUsed {
+                execution: 21_000,
+                state: 0,
+            }
+            .encode_to_vec(),
+            vec![0xc4, 0x82, 0x52, 0x08, 0x80]
+        );
+        // [status, [execution, state], logs] -> c7 01 c4 82 52 08 80 c0
+        assert_eq!(
+            FrameReceipt {
+                status: FRAME_RECEIPT_STATUS_SUCCESS,
+                gas_used: GasUsed {
+                    execution: 21_000,
+                    state: 0,
+                },
+                logs: Vec::new(),
+            }
+            .encode_to_vec(),
+            vec![0xc7, 0x01, 0xc4, 0x82, 0x52, 0x08, 0x80, 0xc0]
+        );
+    }
+
     #[test]
     fn frame_receipt_trie_encoding_is_eip8141_payload() {
         let receipt = Receipt {
@@ -939,7 +1039,10 @@ mod test {
             payer: Some(Address::from_low_u64_be(0xBEEF)),
             frame_receipts: Some(vec![FrameReceipt {
                 status: FRAME_RECEIPT_STATUS_SUCCESS,
-                gas_used: 21_000,
+                gas_used: GasUsed {
+                    execution: 21_000,
+                    state: 0,
+                },
                 logs: Vec::new(),
             }]),
         };
@@ -1010,12 +1113,18 @@ mod test {
             frame_receipts: Some(vec![
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_SUCCESS,
-                    gas_used: 100000,
+                    gas_used: GasUsed {
+                        execution: 100000,
+                        state: 0,
+                    },
                     logs: vec![],
                 },
                 FrameReceipt {
                     status: FRAME_RECEIPT_STATUS_SUCCESS,
-                    gas_used: 200000,
+                    gas_used: GasUsed {
+                        execution: 200000,
+                        state: 0,
+                    },
                     logs: vec![Log {
                         address: Address::from_low_u64_be(0xbeef),
                         topics: vec![],
@@ -1047,7 +1156,10 @@ mod test {
             payer: None,
             frame_receipts: Some(vec![FrameReceipt {
                 status: FRAME_RECEIPT_STATUS_SUCCESS,
-                gas_used: 21000,
+                gas_used: GasUsed {
+                    execution: 21000,
+                    state: 0,
+                },
                 logs: vec![],
             }]),
         };

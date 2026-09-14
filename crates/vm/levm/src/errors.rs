@@ -2,7 +2,7 @@ use bytes::Bytes;
 use derive_more::derive::Display;
 use ethrex_common::{
     Address, H256, U256,
-    types::{FakeExponentialError, Log},
+    types::{FakeExponentialError, GasUsed, Log},
 };
 use serde::{Deserialize, Serialize};
 use thiserror;
@@ -275,8 +275,8 @@ pub struct ExecutionReport {
     pub payer_address: Option<Address>,
     /// For frame transactions: per-frame results (status, gas_used, logs).
     /// `status` is a `FRAME_RECEIPT_STATUS_*` code (0 = failure, 1 = success,
-    /// 3 = skipped due to failed atomic batch, per EIP-8141 receipt encoding).
-    pub frame_results: Option<Vec<(u8, u64, Vec<Log>)>>,
+    /// 2 = skipped due to failed atomic batch, per EIP-8141 receipt encoding).
+    pub frame_results: Option<Vec<(u8, GasUsed, Vec<Log>)>>,
 }
 
 impl ExecutionReport {

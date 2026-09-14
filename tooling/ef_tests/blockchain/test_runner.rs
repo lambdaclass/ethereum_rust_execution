@@ -141,7 +141,7 @@ pub async fn run_ef_test(
     // benefit in single-threaded zkVM guest builds. The non-stateless runs are the right
     // home for this check.
     #[cfg(not(feature = "stateless"))]
-    if test.network == Fork::Amsterdam {
+    if test.network >= Fork::Amsterdam {
         run_two_pass_parallel(test_key, test).await?;
     }
 
@@ -422,13 +422,43 @@ fn exception_in_rlp_decoding(block_fixture: &BlockWithRLP) -> bool {
         .iter()
         .any(|case| matches!(case, BlockChainExpectedException::TxtException(msg) if msg == "Nonce is max"));
 
+    // EIP-8141 structural frame rules (frame count, reserved modes, forbidden
+    // flag/target combinations): ethrex enforces some in the type-0x06 decoder
+    // and the rest at frame execution, so failing to decode is one legitimate
+    // outcome for a fixture expecting an invalid frame format.
+    let expects_invalid_frame_format = block_fixture
+        .expect_exception
+        .as_ref()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .any(|case| matches!(case, BlockChainExpectedException::InvalidFrameFormat));
+
+    // A fee field of 2^256 or more does not fit a transaction's `U256` fee
+    // fields, so the fixtures carrying 33-byte fees fail here. Fees below that
+    // bound always decode — legacy `gas_price` is `U256` as well — so the
+    // `gas_limit * price` product-overflow fixtures (a 31-byte legacy price, a
+    // 2^255 frame fee) decode fine and are rejected later at execution without
+    // consulting this arm — the same split as the nonce cases above.
+    let expects_fee_overflow = block_fixture
+        .expect_exception
+        .as_ref()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .any(|case| matches!(case, BlockChainExpectedException::FeeOverflow));
+
     match CoreBlock::decode(block_fixture.rlp.as_ref()) {
         Ok(_) => {
             assert!(!expects_rlp_exception);
             false
         }
         Err(_) => {
-            assert!(expects_rlp_exception || expects_invalid_signature || expects_nonce_too_high);
+            assert!(
+                expects_rlp_exception
+                    || expects_invalid_signature
+                    || expects_nonce_too_high
+                    || expects_invalid_frame_format
+                    || expects_fee_overflow
+            );
             true
         }
     }
