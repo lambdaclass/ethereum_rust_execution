@@ -143,7 +143,11 @@ async fn build_block_with_txs(
 /// its sharded-worker performance optimization: the resulting Merkle root is a
 /// pure function of the final account states, so this single-threaded replay
 /// via public `Store` APIs reproduces the identical value production computes.
-fn forge_state_root(store: &Store, parent_header: &BlockHeader, bal: &BlockAccessList) -> H256 {
+pub(crate) fn forge_state_root(
+    store: &Store,
+    parent_header: &BlockHeader,
+    bal: &BlockAccessList,
+) -> H256 {
     let synthesis = synthesize_bal_updates(bal);
     let updates: Vec<AccountUpdate> = synthesis
         .into_iter()
