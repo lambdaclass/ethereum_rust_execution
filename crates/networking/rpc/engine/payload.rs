@@ -13,6 +13,7 @@ use ethrex_crypto::NativeCrypto;
 use ethrex_p2p::sync::SyncMode;
 use ethrex_rlp::{decode::RLPDecode, encode::RLPEncode, error::RLPDecodeError};
 use serde_json::Value;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
@@ -371,6 +372,11 @@ impl NewPayloadV5Request {
         context: RpcApiContext,
         make_witness: bool,
     ) -> Result<Value, RpcErr> {
+        // The block-level `[METRIC] BLOCK` line covers execution only. On a chain
+        // of near-empty blocks the work this handler does around it ; decoding the
+        // payload into a block and the pre-execution checks ; is the same order of
+        // magnitude as the execution itself, and was previously unmeasured.
+        let handler_start = Instant::now();
         // Must precede every other check: a present-but-undecodable BAL answers
         // `{status: INVALID, latestValidHash: null}` (engine spec, amsterdam.md
         // newPayloadV5 spec 3). The field was dropped from `self.payload` at parse
@@ -397,6 +403,7 @@ impl NewPayloadV5Request {
         // so the block hash check correctly detects BAL corruption.
         let block_access_list_hash = self.raw_bal_hash;
 
+        let decode_start = Instant::now();
         let block = match get_block_from_payload(
             &self.payload,
             Some(self.parent_beacon_block_root),
@@ -410,6 +417,7 @@ impl NewPayloadV5Request {
                 ))?);
             }
         };
+        let decode_elapsed = decode_start.elapsed();
 
         let chain_config = context.storage.get_chain_config();
 
@@ -445,6 +453,9 @@ impl NewPayloadV5Request {
         }
 
         let bal = self.payload.block_access_list.clone();
+        let block_number = block.header.number;
+        let tx_count = block.body.transactions.len();
+        let execute_start = Instant::now();
         let payload_status = handle_new_payload_v4(
             &self.payload,
             context,
@@ -454,6 +465,19 @@ impl NewPayloadV5Request {
             make_witness,
         )
         .await?;
+        let execute_elapsed = execute_start.elapsed();
+        let total_elapsed = handler_start.elapsed();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        // Whatever is neither payload decoding nor execution: the payload, request
+        // and BAL-ordering validations plus the two block-hash comparisons.
+        let checks_ms = (ms(total_elapsed) - ms(decode_elapsed) - ms(execute_elapsed)).max(0.0);
+        info!(
+            "[METRIC] NEWPAYLOAD {block_number} | {:.2} ms total | decode {:.2} ms | checks {:.2} ms | execute {:.2} ms | {tx_count} txs",
+            ms(total_elapsed),
+            ms(decode_elapsed),
+            checks_ms,
+            ms(execute_elapsed),
+        );
         serde_json::to_value(payload_status).map_err(|error| RpcErr::Internal(error.to_string()))
     }
 }

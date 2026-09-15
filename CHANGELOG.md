@@ -12,6 +12,10 @@
 
 ## Perf
 
+### 2026-09-15
+
+- Stop creating OS threads per block in the execution pipeline. Execution now runs on the calling thread and the merkleizer on a persistent pool, and a block with no transactions merkleizes inline and skips the speculative warmer entirely. On a chain of near-empty blocks the pipeline's fixed cost dominates: block processing measured 1.34 ms, of which 0.39 ms was the merkleizer's start delay, the gap between the start of the phase and that thread's first instruction. Also adds `[METRIC] NEWPAYLOAD` and `[METRIC] ENGINE_RPC` lines, which split the engine `newPayload` path into payload decoding, JSON parsing, JWT verification, the pre-execution checks and execution; none of that was measured before [#7281](https://github.com/lambdaclass/ethrex/pull/7281)
+
 ### 2026-09-03
 
 - EIP-8037 (execution-specs#3478, consensus-breaking): when a successful child frame merges, the state-gas reservoir now repays the spill still outstanding in the merged frame back into `gas_remaining`, debiting the reservoir by the same amount. A cross-frame refund can credit the reservoir while the `gas_remaining` that funded the charge stays reduced; the merge is the first point where the claim and the credit share a frame. Billing-neutral by construction — the user total (`gas_limit - gas_remaining - reservoir`) and the EIP-7778 dimensions are unchanged — but it changes how much execution gas a parent frame has after a child returns, so it is consensus-visible. Fixtures move to `tests-glamsterdam-devnet@v8.1.4` [#7250](https://github.com/lambdaclass/ethrex/pull/7250)

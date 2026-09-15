@@ -84,6 +84,7 @@ use ethrex_storage::Store;
 use serde::Deserialize;
 use serde_json::Value;
 use spawned_concurrency::tasks::ActorRef;
+use std::time::Instant;
 use std::{
     collections::{HashMap, HashSet},
     future::IntoFuture,
@@ -1008,6 +1009,12 @@ pub async fn handle_authrpc_request(
     auth_header: Option<TypedHeader<Authorization<Bearer>>>,
     body: String,
 ) -> Result<Json<Value>, StatusCode> {
+    // The consensus client times the whole engine_newPayload round trip, which is
+    // several times what the handler itself reports. Split the parts that sit
+    // between the two ; JSON parsing of the payload, JWT verification and
+    // dispatch ; so the difference is attributable instead of assumed.
+    let request_start = Instant::now();
+    let body_len = body.len();
     let wrapper: RpcRequestWrapper = match serde_json::from_str(&body) {
         Ok(w) => w,
         Err(_) => {
@@ -1017,13 +1024,18 @@ pub async fn handle_authrpc_request(
         }
     };
 
+    let json_parse_elapsed = request_start.elapsed();
+
     // Reject empty / oversize batches before any auth or dispatch work so a
     // 100k-request body can't burn JWT crypto or memory.
     if let Some(err) = validate_batch(&wrapper) {
         return Ok(Json(err));
     }
 
-    if let Err(error) = authenticate(&service_context.node_data.jwt_secret, auth_header) {
+    let auth_start = Instant::now();
+    let auth_result = authenticate(&service_context.node_data.jwt_secret, auth_header);
+    let auth_elapsed = auth_start.elapsed();
+    if let Err(error) = auth_result {
         // Auth failed: respond before dispatching anything. For batches, mirror
         // the batch shape and emit one error response per request so clients
         // can still correlate by id.
@@ -1051,7 +1063,20 @@ pub async fn handle_authrpc_request(
 
     let res = match wrapper {
         RpcRequestWrapper::Single(req) => {
+            let dispatch_start = Instant::now();
             let res = map_authrpc_requests(&req, service_context).await;
+            let dispatch_elapsed = dispatch_start.elapsed();
+            if req.method.starts_with("engine_newPayload") {
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+                info!(
+                    "[METRIC] ENGINE_RPC {} | {:.2} ms in-process | json {:.2} ms | auth {:.2} ms | dispatch {:.2} ms | {body_len} B",
+                    req.method,
+                    ms(request_start.elapsed()),
+                    ms(json_parse_elapsed),
+                    ms(auth_elapsed),
+                    ms(dispatch_elapsed),
+                );
+            }
             rpc_response(req.id, res).map_err(|_| StatusCode::BAD_REQUEST)?
         }
         RpcRequestWrapper::Multiple(requests) => {

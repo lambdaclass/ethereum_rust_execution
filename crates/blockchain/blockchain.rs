@@ -279,6 +279,15 @@ pub struct Blockchain {
     /// merkleizes seed a shared one via [`Self::for_test_harness_with_pool`].
     /// Use [`Self::merkle_pool`] to read it.
     merkle_pool: OnceLock<Arc<rayon::ThreadPool>>,
+    /// Persistent pool that runs the per-block merkleizer.
+    ///
+    /// Four threads, and one block uses one of them: the point is not parallelism
+    /// but avoiding an OS thread creation per block. Measured on a chain of
+    /// near-empty blocks, the merkleizer's start delay (from the start of the
+    /// exec/merkle phase to its first instruction) was 0.31 ms of a 1.2 ms block
+    /// when it was spawned fresh each time. Separate from the merkleization pool
+    /// because the merkleizer itself opens a scope on that one.
+    pipeline_pool: OnceLock<Arc<rayon::ThreadPool>>,
     /// Cache handoff slot from the mempool prewarmer to
     /// `execute_block_pipeline`; see `PrewarmedCache` and `crate::prewarm`.
     prewarmed: PrewarmedCache,
@@ -567,6 +576,25 @@ impl Blockchain {
         self.merkle_pool.get_or_init(Self::build_merkle_pool)
     }
 
+    /// Build the pool that runs the per-block merkleizer.
+    fn build_pipeline_pool() -> Arc<rayon::ThreadPool> {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                // One task per block in flight; the spare threads only matter when
+                // block processing overlaps (a payload arriving while the syncer
+                // runs), where a saturated pool would serialise them.
+                .num_threads(4)
+                .thread_name(|i| format!("block-pipeline-{i}"))
+                .build()
+                .expect("Failed to create block pipeline thread pool"),
+        )
+    }
+
+    /// This `Blockchain`'s block-pipeline pool, building it on first use.
+    fn pipeline_pool(&self) -> &rayon::ThreadPool {
+        self.pipeline_pool.get_or_init(Self::build_pipeline_pool)
+    }
+
     /// Builds the merkleization pool now, unless it is already seeded.
     ///
     /// Node startup calls this so a pool that cannot be created fails the process at
@@ -599,6 +627,7 @@ impl Blockchain {
             payloads: Arc::new(TokioMutex::new(Vec::new())),
             options: blockchain_opts,
             merkle_pool: OnceLock::new(),
+            pipeline_pool: OnceLock::new(),
             prewarmed: PrewarmedCache::default(),
         }
     }
@@ -626,6 +655,7 @@ impl Blockchain {
                 ..Default::default()
             },
             merkle_pool: OnceLock::new(),
+            pipeline_pool: OnceLock::new(),
             prewarmed: PrewarmedCache::default(),
         }
     }
@@ -675,6 +705,7 @@ impl Blockchain {
             payloads: Arc::new(TokioMutex::new(Vec::new())),
             options,
             merkle_pool: OnceLock::new(),
+            pipeline_pool: OnceLock::new(),
             prewarmed: PrewarmedCache::default(),
         }
     }
@@ -988,15 +1019,24 @@ impl Blockchain {
         #[cfg(feature = "rayon")]
         let bal_warmer = bal.clone();
 
+        // A block with no transactions has nothing worth warming: execution only
+        // touches the handful of entries the system calls and withdrawals reach,
+        // and the thread spawned to warm them concurrently costs more than the
+        // cold reads it saves. Warming is best-effort and populates caches only,
+        // so skipping it cannot change the block's result.
+        let block_has_transactions = !block.body.transactions.is_empty();
+
         let (execution_result, merkleization_result, warmer_duration) = std::thread::scope(
-            |s| -> Result<_, ChainError> {
+            // `s` carries the warmer and trie-prefetch threads, which are rayon-only;
+            // without that feature nothing is spawned into the scope.
+            |#[allow(unused_variables)] s| -> Result<_, ChainError> {
                 #[cfg(feature = "rayon")]
                 let vm_type = vm.vm_type;
                 let cancelled_ref = &cancelled;
                 #[cfg(feature = "rayon")]
                 let bal_prefetch_enabled = self.options.bal_prefetch_enabled;
                 #[cfg(feature = "rayon")]
-                let warm_handle = (!collect_witness)
+                let warm_handle = (!collect_witness && block_has_transactions)
                     .then(|| {
                         std::thread::Builder::new()
                             .name("block_executor_warmer".to_string())
@@ -1103,89 +1143,89 @@ impl Blockchain {
                         (Some(tx), Some(rx))
                     };
 
-                let execution_handle = std::thread::Builder::new()
-                    .name("block_executor_execution".to_string())
-                    .spawn_scoped(s, move || -> Result<_, ChainError> {
-                        // Cheap Arc pointer bump: `execute_block_pipeline` takes
-                        // ownership, but the header-commitment check below still needs
-                        // the input BAL on the parallel path (produced_bal == None).
-                        let header_bal = bal.clone();
-                        let result = vm.execute_block_pipeline(
-                            block,
-                            tx,
-                            queue_length_ref,
-                            bal,
-                            bal_parallel_exec_enabled,
-                        );
-                        cancelled_ref.store(true, Ordering::Relaxed);
-                        let (execution_result, produced_bal) = result?;
+                // Execution runs on this thread rather than a spawned one: the
+                // calling thread would otherwise only wait for it, and creating an
+                // OS thread per block is not free. On a chain of near-empty blocks
+                // the merkleizer's measured start delay (thread creation plus
+                // scheduling) was ~29% of the whole block, and part of that was
+                // this spawn happening first. Defined here, run below, after the
+                // merkleizer is already on its way.
+                let execution_closure = move || -> Result<_, ChainError> {
+                    // Cheap Arc pointer bump: `execute_block_pipeline` takes
+                    // ownership, but the header-commitment check below still needs
+                    // the input BAL on the parallel path (produced_bal == None).
+                    let header_bal = bal.clone();
+                    let result = vm.execute_block_pipeline(
+                        block,
+                        tx,
+                        queue_length_ref,
+                        bal,
+                        bal_parallel_exec_enabled,
+                    );
+                    cancelled_ref.store(true, Ordering::Relaxed);
+                    let (execution_result, produced_bal) = result?;
 
-                        // Validate execution went alright
-                        if let Err(e) =
-                            validate_gas_used(execution_result.block_gas_used, &block.header)
-                        {
-                            ethrex_vm::log_gas_used_mismatch(
-                                &execution_result.tx_gas_breakdowns,
-                                block.header.number,
-                                execution_result.block_gas_used,
-                                block.header.gas_used,
-                            );
-                            return Err(e.into());
-                        }
-                        validate_receipts_root_and_logs_bloom(
-                            &block.header,
-                            &execution_result.receipts,
-                            &NativeCrypto,
-                        )?;
-                        validate_requests_hash(
+                    // Validate execution went alright
+                    if let Err(e) =
+                        validate_gas_used(execution_result.block_gas_used, &block.header)
+                    {
+                        ethrex_vm::log_gas_used_mismatch(
+                            &execution_result.tx_gas_breakdowns,
+                            block.header.number,
+                            execution_result.block_gas_used,
+                            block.header.gas_used,
+                        );
+                        return Err(e.into());
+                    }
+                    validate_receipts_root_and_logs_bloom(
+                        &block.header,
+                        &execution_result.receipts,
+                        &NativeCrypto,
+                    )?;
+                    validate_requests_hash(
+                        &block.header,
+                        &chain_config,
+                        &execution_result.requests,
+                    )?;
+                    // EIP-7928 block_access_list_hash commitment check.
+                    //
+                    // Sequential Amsterdam path: rebuilds a BAL and returns
+                    // Some(produced_bal), so the full hash+index+size check runs here.
+                    //
+                    // Parallel Amsterdam path: uses the header BAL directly to drive
+                    // execution and returns produced_bal = None. The header BAL's
+                    // index/size are already validated inside execute_block_pipeline,
+                    // and content-equivalence (unread_storage_reads /
+                    // unaccessed_pure_accounts) plus the state_root comparison prove the
+                    // header BAL is the canonical one. The one thing those checks do NOT
+                    // bind is the header commitment itself, so we must compare
+                    // keccak(rlp(header_bal)) against header.block_access_list_hash here;
+                    // otherwise a block with a content-valid BAL but a forged commitment
+                    // is accepted on this path while every spec-conformant client (and
+                    // our own sequential/batch paths) rejects it. This is a pure hash
+                    // compare on a BAL already in memory; the parallel exec optimization
+                    // (no BAL rebuild) is preserved.
+                    //
+                    // Pre-Amsterdam blocks never record a BAL, so both arms are skipped.
+                    if let Some(bal) = &produced_bal {
+                        validate_block_access_list_hash(
                             &block.header,
                             &chain_config,
-                            &execution_result.requests,
+                            bal,
+                            block.body.transactions.len(),
+                            &NativeCrypto,
                         )?;
-                        // EIP-7928 block_access_list_hash commitment check.
-                        //
-                        // Sequential Amsterdam path: rebuilds a BAL and returns
-                        // Some(produced_bal), so the full hash+index+size check runs here.
-                        //
-                        // Parallel Amsterdam path: uses the header BAL directly to drive
-                        // execution and returns produced_bal = None. The header BAL's
-                        // index/size are already validated inside execute_block_pipeline,
-                        // and content-equivalence (unread_storage_reads /
-                        // unaccessed_pure_accounts) plus the state_root comparison prove the
-                        // header BAL is the canonical one. The one thing those checks do NOT
-                        // bind is the header commitment itself, so we must compare
-                        // keccak(rlp(header_bal)) against header.block_access_list_hash here;
-                        // otherwise a block with a content-valid BAL but a forged commitment
-                        // is accepted on this path while every spec-conformant client (and
-                        // our own sequential/batch paths) rejects it. This is a pure hash
-                        // compare on a BAL already in memory; the parallel exec optimization
-                        // (no BAL rebuild) is preserved.
-                        //
-                        // Pre-Amsterdam blocks never record a BAL, so both arms are skipped.
-                        if let Some(bal) = &produced_bal {
-                            validate_block_access_list_hash(
-                                &block.header,
-                                &chain_config,
-                                bal,
-                                block.body.transactions.len(),
-                                &NativeCrypto,
-                            )?;
-                        } else if let Some(header_bal) = header_bal.as_deref()
-                            && chain_config.is_amsterdam_activated(block.header.timestamp)
-                            && !header_bal.matches_commitment(
-                                block.header.block_access_list_hash,
-                                &NativeCrypto,
-                            )
-                        {
-                            return Err(InvalidBlockError::BlockAccessListHashMismatch.into());
-                        }
+                    } else if let Some(header_bal) = header_bal.as_deref()
+                        && chain_config.is_amsterdam_activated(block.header.timestamp)
+                        && !header_bal
+                            .matches_commitment(block.header.block_access_list_hash, &NativeCrypto)
+                    {
+                        return Err(InvalidBlockError::BlockAccessListHashMismatch.into());
+                    }
 
-                        let exec_end_instant = Instant::now();
-                        Ok((execution_result, produced_bal, exec_end_instant))
-                    })
-                    .map_err(|e| {
-                        ChainError::Custom(format!("Failed to spawn execution thread: {e}"))
-                    })?;
+                    let exec_end_instant = Instant::now();
+                    Ok((execution_result, produced_bal, exec_end_instant))
+                };
                 let parent_header_ref = &parent_header; // Avoid moving to thread
                 // Merkleizer returns (list, streaming witness or None on BAL path, merkle_start, merkle_end).
                 type MerkleResult = Result<
@@ -1197,67 +1237,111 @@ impl Blockchain {
                     ),
                     StoreError,
                 >;
-                let merkleize_handle = std::thread::Builder::new()
-                    .name("block_executor_merkleizer".to_string())
-                    .spawn_scoped(s, move || -> MerkleResult {
-                        let merkle_start_instant = Instant::now();
-                        // Merkleizer behavior MUST match the channel-creation decision above:
-                        // a channel is created (and execution streams per-tx updates into it via
-                        // `send_state_transitions_tx`) in every case except `bal=Some &&
-                        // parallel_exec`. So the optimistic synthesized-updates path is valid ONLY
-                        // when no channel exists (`rx_for_merkle` is None); whenever a channel was
-                        // created we must consume it. Taking the optimistic path while a channel is
-                        // live drops `rx` mid-execution and races execution's later sends (the
-                        // post-requests send especially), surfacing as "sending on a closed channel".
-                        let (account_updates_list, streaming_witness) = match rx_for_merkle {
-                            None => {
-                                let prepared = optimistic_updates.expect(
+                let merkle_closure = move || -> MerkleResult {
+                    let merkle_start_instant = Instant::now();
+                    // Merkleizer behavior MUST match the channel-creation decision above:
+                    // a channel is created (and execution streams per-tx updates into it via
+                    // `send_state_transitions_tx`) in every case except `bal=Some &&
+                    // parallel_exec`. So the optimistic synthesized-updates path is valid ONLY
+                    // when no channel exists (`rx_for_merkle` is None); whenever a channel was
+                    // created we must consume it. Taking the optimistic path while a channel is
+                    // live drops `rx` mid-execution and races execution's later sends (the
+                    // post-requests send especially), surfacing as "sending on a closed channel".
+                    let (account_updates_list, streaming_witness) = match rx_for_merkle {
+                        None => {
+                            let prepared = optimistic_updates.expect(
                                     "optimistic updates are present when the streaming channel is absent",
                                 );
-                                let list = self.handle_merkleization_bal_from_updates(
-                                    prepared,
-                                    parent_header_ref,
-                                )?;
-                                // The merkleizer builds the trie from the BAL-synthesized
-                                // updates and ignores the streaming channel. But sequential
-                                // execution (`!bal_parallel_exec_enabled`) still streams per-tx
-                                // updates over `rx_for_merkle`; if we drop the receiver before
-                                // the executor's last send, that send fails with "sending on a
-                                // closed channel", racing the real validation error. Drain the
-                                // channel (the updates are redundant here — the BAL path is
-                                // authoritative) so the executor always completes cleanly.
-                                if let Some(rx) = rx_for_merkle {
-                                    for _ in rx {}
-                                }
-                                (list, None)
-                            }
-                            Some(rx) => self.handle_merkleization(
-                                rx,
+                            let list = self.handle_merkleization_bal_from_updates(
+                                prepared,
                                 parent_header_ref,
-                                queue_length_ref,
-                                max_queue_length_ref,
-                                collect_witness,
-                            )?,
-                        };
-                        let merkle_end_instant = Instant::now();
-                        Ok((
-                            account_updates_list,
-                            streaming_witness,
-                            merkle_start_instant,
-                            merkle_end_instant,
-                        ))
-                    })
-                    .map_err(|e| {
-                        ChainError::Custom(format!("Failed to spawn merkleizer thread: {e}"))
-                    })?;
-                let execution_result = execution_handle.join().unwrap_or_else(|_| {
-                    Err(ChainError::Custom("execution thread panicked".to_string()))
-                });
-                let merkleization_result = merkleize_handle.join().unwrap_or_else(|_| {
-                    Err(StoreError::Custom(
-                        "merkleization thread panicked".to_string(),
+                            )?;
+                            // The merkleizer builds the trie from the BAL-synthesized
+                            // updates and ignores the streaming channel. But sequential
+                            // execution (`!bal_parallel_exec_enabled`) still streams per-tx
+                            // updates over `rx_for_merkle`; if we drop the receiver before
+                            // the executor's last send, that send fails with "sending on a
+                            // closed channel", racing the real validation error. Drain the
+                            // channel (the updates are redundant here — the BAL path is
+                            // authoritative) so the executor always completes cleanly.
+                            if let Some(rx) = rx_for_merkle {
+                                for _ in rx {}
+                            }
+                            (list, None)
+                        }
+                        Some(rx) => self.handle_merkleization(
+                            rx,
+                            parent_header_ref,
+                            queue_length_ref,
+                            max_queue_length_ref,
+                            collect_witness,
+                        )?,
+                    };
+                    let merkle_end_instant = Instant::now();
+                    Ok((
+                        account_updates_list,
+                        streaming_witness,
+                        merkle_start_instant,
+                        merkle_end_instant,
                     ))
-                });
+                };
+                // The merkleizer runs on the persistent pipeline pool and execution
+                // runs here, on the calling thread. Neither creates an OS thread per
+                // block. `in_place_scope` runs this body on the calling thread and
+                // does not return until the spawned merkleizer has finished, so the
+                // borrows both closures hold stay valid.
+                // `catch_unwind` on each keeps the previous semantics, where a panic
+                // in either was reported as an error instead of unwinding.
+                let (execution_result, merkleization_result) = if block_has_transactions {
+                    let (merkle_tx, merkle_rx) = std::sync::mpsc::sync_channel::<MerkleResult>(1);
+                    let mut execution_slot = None;
+                    self.pipeline_pool().in_place_scope(|ps| {
+                        ps.spawn(move |_| {
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                merkle_closure,
+                            ))
+                            .unwrap_or_else(|_| {
+                                Err(StoreError::Custom("merkleization panicked".to_string()))
+                            });
+                            let _ = merkle_tx.send(result);
+                        });
+                        execution_slot = Some(
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                execution_closure,
+                            ))
+                            .unwrap_or_else(|_| {
+                                Err(ChainError::Custom("execution panicked".to_string()))
+                            }),
+                        );
+                    });
+                    let merkleization_result = merkle_rx.recv().unwrap_or_else(|_| {
+                        Err(StoreError::Custom(
+                            "merkleizer finished without sending a result".to_string(),
+                        ))
+                    });
+                    (
+                        execution_slot.expect("execution runs inside the pipeline scope"),
+                        merkleization_result,
+                    )
+                } else {
+                    // A block with no transactions streams no per-tx updates, so the
+                    // merkleizer would spend the whole of execution parked on an empty
+                    // channel and do all of its work afterwards anyway. Running both here,
+                    // in order, gives up no overlap and avoids handing the task to a pool
+                    // worker that has to be woken first. The streaming channel is unbounded,
+                    // so execution still completes without waiting for a reader.
+                    let execution_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(execution_closure))
+                            .unwrap_or_else(|_| {
+                                Err(ChainError::Custom("execution panicked".to_string()))
+                            });
+                    let merkleization_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(merkle_closure))
+                            .unwrap_or_else(|_| {
+                                Err(StoreError::Custom("merkleization panicked".to_string()))
+                            });
+                    (execution_result, merkleization_result)
+                };
                 #[cfg(feature = "rayon")]
                 let warmer_duration = warm_handle
                     .map(|handle| {
