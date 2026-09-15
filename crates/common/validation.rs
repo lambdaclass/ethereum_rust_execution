@@ -132,12 +132,31 @@ pub fn validate_requests_hash(
     chain_config: &ChainConfig,
     requests: &[Requests],
 ) -> Result<(), InvalidBlockError> {
+    validate_requests_hash_impl(header, chain_config, requests, compute_requests_hash)
+}
+pub fn validate_requests_hash_with_crypto(
+    header: &BlockHeader,
+    chain_config: &ChainConfig,
+    requests: &[Requests],
+    crypto: &dyn ethrex_crypto::Crypto,
+) -> Result<(), InvalidBlockError> {
+    validate_requests_hash_impl(header, chain_config, requests, |encoded| {
+        crate::types::requests::compute_requests_hash_with_crypto(encoded, crypto)
+    })
+}
+
+fn validate_requests_hash_impl(
+    header: &BlockHeader,
+    chain_config: &ChainConfig,
+    requests: &[Requests],
+    hash: impl FnOnce(&[EncodedRequests]) -> crate::H256,
+) -> Result<(), InvalidBlockError> {
     if !chain_config.is_prague_activated(header.timestamp) {
         return Ok(());
     }
 
     let encoded_requests: Vec<EncodedRequests> = requests.iter().map(|r| r.encode()).collect();
-    let computed_requests_hash = compute_requests_hash(&encoded_requests);
+    let computed_requests_hash = hash(&encoded_requests);
     let valid = header
         .requests_hash
         .map(|requests_hash| requests_hash == computed_requests_hash)

@@ -5,7 +5,8 @@ use ethrex_common::types::block_execution_witness::{ExecutionWitness, GuestProgr
 use ethrex_common::types::{Block, Receipt, validate_block_body};
 use ethrex_common::{
     H256, U256, validate_block_access_list_hash, validate_block_pre_execution, validate_gas_used,
-    validate_receipts_root_and_logs_bloom, validate_requests_hash,
+    validate_receipts_root_and_logs_bloom,
+    validate_requests_hash_with_crypto as validate_requests_hash,
 };
 use ethrex_crypto::Crypto;
 use ethrex_vm::{Evm, GuestProgramStateWrapper, VmDatabase};
@@ -172,8 +173,13 @@ where
         })?;
 
         report_cycles("validate_requests_hash", || {
-            validate_requests_hash(&block.header, &chain_config, &result.requests)
-                .map_err(ExecutionError::RequestsRootValidation)
+            validate_requests_hash(
+                &block.header,
+                &chain_config,
+                &result.requests,
+                crypto.as_ref(),
+            )
+            .map_err(ExecutionError::RequestsRootValidation)
         })?;
 
         if let Some(bal) = &bal {

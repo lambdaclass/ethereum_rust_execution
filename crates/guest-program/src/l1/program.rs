@@ -73,7 +73,7 @@ pub fn new_payload_request_to_block(
 ) -> Result<ethrex_common::types::Block, String> {
     use bytes::Bytes;
     use ethrex_common::constants::DEFAULT_OMMERS_HASH;
-    use ethrex_common::types::requests::compute_requests_hash;
+    use ethrex_common::types::requests::compute_requests_hash_with_crypto;
     use ethrex_common::types::{
         Block, BlockBody, BlockHeader, Transaction, Withdrawal, compute_transactions_root,
         compute_withdrawals_root,
@@ -106,7 +106,7 @@ pub fn new_payload_request_to_block(
 
     // Build execution_requests from the SSZ typed ExecutionRequests field
     let execution_requests = req.execution_requests.to_encoded_requests();
-    let requests_hash = compute_requests_hash(&execution_requests);
+    let requests_hash = compute_requests_hash_with_crypto(&execution_requests, crypto);
 
     // Convert base_fee_per_gas from [u8; 32] LE uint256 to u64. The helper rejects
     // non-zero upper bytes so a single block maps to a single hash_tree_root (see
@@ -296,7 +296,7 @@ pub fn verify_stateless_block(
     // `into_with_burned_fees` touches, so a second call cannot reach a
     // different verdict.
 
-    let computed_hash = verified_header.hash();
+    let computed_hash = verified_header.compute_block_hash(crypto.as_ref());
     let expected_hash =
         ethrex_common::H256::from_slice(&new_payload_request.execution_payload.block_hash);
     if computed_hash != expected_hash {

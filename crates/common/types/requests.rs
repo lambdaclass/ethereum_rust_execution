@@ -268,3 +268,71 @@ pub fn compute_requests_hash(requests: &[EncodedRequests]) -> H256 {
     }
     H256::from_slice(&hasher.finalize())
 }
+
+/// Compute the EIP-7685 requests hash using the caller's crypto provider.
+/// Empty requests (type byte only) are excluded, matching `compute_requests_hash`.
+pub fn compute_requests_hash_with_crypto(
+    requests: &[EncodedRequests],
+    crypto: &dyn ethrex_crypto::Crypto,
+) -> H256 {
+    let mut hashes = Vec::with_capacity(requests.len() * 32);
+    for request in requests {
+        if request.0.len() > 1 {
+            hashes.extend_from_slice(&crypto.sha256(&request.0));
+        }
+    }
+    H256(crypto.sha256(&hashes))
+}
+
+#[cfg(test)]
+mod provider_hash_tests {
+    use super::*;
+    use ethrex_crypto::{Crypto, NativeCrypto};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CountingCrypto(AtomicUsize);
+    impl Crypto for CountingCrypto {
+        fn sha256(&self, input: &[u8]) -> [u8; 32] {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            NativeCrypto.sha256(input)
+        }
+    }
+
+    #[test]
+    fn provider_matches_native_and_skips_empty_requests() {
+        for data in [
+            vec![],
+            vec![vec![]],
+            vec![vec![0], vec![1], vec![2]],
+            vec![vec![0, 42]],
+            vec![vec![0, 1, 2], vec![1], vec![2, 3, 4]],
+        ] {
+            let requests: Vec<_> = data
+                .into_iter()
+                .map(|b| EncodedRequests(b.into()))
+                .collect();
+            let crypto = CountingCrypto::default();
+            assert_eq!(
+                compute_requests_hash_with_crypto(&requests, &crypto),
+                compute_requests_hash(&requests)
+            );
+            assert_eq!(
+                crypto.0.load(Ordering::Relaxed),
+                1 + requests.iter().filter(|r| r.0.len() > 1).count()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_requests_hash_is_sha256_of_empty_input() {
+        assert_eq!(
+            compute_requests_hash_with_crypto(&[], &NativeCrypto),
+            H256::from_slice(&[
+                0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+                0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+                0x78, 0x52, 0xb8, 0x55
+            ])
+        );
+    }
+}
