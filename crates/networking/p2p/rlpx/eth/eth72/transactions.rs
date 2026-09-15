@@ -6,7 +6,7 @@ use crate::rlpx::{
     utils::{snappy_compress, snappy_decompress, snappy_decompress_bounded},
 };
 use crate::types::Node;
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use ethrex_blockchain::Blockchain;
 use ethrex_blockchain::error::MempoolError;
 use ethrex_common::types::{Fork, P2PTransaction, WrappedEIP4844Transaction};
@@ -247,7 +247,7 @@ impl NewPooledTransactionHashes72 {
 impl RLPxMessage for NewPooledTransactionHashes72 {
     const CODE: u8 = 0x08;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         let mask_bytes = cell_mask_to_bytes(self.cell_mask);
         Encoder::new(&mut encoded_data)
@@ -258,7 +258,7 @@ impl RLPxMessage for NewPooledTransactionHashes72 {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -314,7 +314,7 @@ pub fn encode_elided_canonical(wrapped: &WrappedEIP4844Transaction) -> Vec<u8> {
 struct Elided<'a>(&'a P2PTransaction);
 
 impl RLPEncode for Elided<'_> {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         match self.0 {
             P2PTransaction::EIP4844TransactionWithBlobs(wrapped) => {
                 <[u8] as RLPEncode>::encode(&encode_elided_canonical(wrapped), buf)
@@ -443,7 +443,7 @@ impl PooledTransactions72 {
 impl RLPxMessage for PooledTransactions72 {
     const CODE: u8 = 0x0A;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let elided: Vec<Elided<'_>> = self.pooled_transactions.iter().map(Elided).collect();
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
@@ -451,7 +451,7 @@ impl RLPxMessage for PooledTransactions72 {
             .encode_field(&elided)
             .finish();
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 

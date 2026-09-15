@@ -689,7 +689,7 @@ impl AsRef<[u8]> for Nibbles {
 }
 
 impl RLPEncode for Nibbles {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf).encode_field(&self.data).finish();
     }
 }

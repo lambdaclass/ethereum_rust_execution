@@ -168,7 +168,7 @@ pub struct ExtWitness {
 }
 
 impl RLPEncode for ExtWitness {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.headers)
             .encode_field(&self.codes)

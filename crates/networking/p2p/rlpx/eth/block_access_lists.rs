@@ -2,7 +2,6 @@ use crate::rlpx::{
     message::RLPxMessage,
     utils::{snappy_compress, snappy_decompress},
 };
-use bytes::BufMut;
 use ethrex_common::types::BlockHash;
 use ethrex_common::types::block_access_list::BlockAccessList;
 use ethrex_rlp::{
@@ -34,9 +33,9 @@ pub const BLOCK_ACCESS_LIST_LIMIT: usize = 1024;
 pub struct OptionalBal(pub Option<BlockAccessList>);
 
 impl RLPEncode for OptionalBal {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         match &self.0 {
-            None => buf.put_u8(0x80),
+            None => buf.push(0x80),
             Some(bal) => bal.encode(buf),
         }
     }
@@ -77,14 +76,14 @@ impl GetBlockAccessLists {
 impl RLPxMessage for GetBlockAccessLists {
     const CODE: u8 = 0x12;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.id)
             .encode_field(&self.block_hashes)
             .finish();
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -120,7 +119,7 @@ impl BlockAccessLists {
 impl RLPxMessage for BlockAccessLists {
     const CODE: u8 = 0x13;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         let bals: Vec<OptionalBal> = self
             .block_access_lists
@@ -133,7 +132,7 @@ impl RLPxMessage for BlockAccessLists {
             .encode_field(&bals)
             .finish();
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 

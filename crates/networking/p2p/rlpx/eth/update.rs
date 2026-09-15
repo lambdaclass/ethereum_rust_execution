@@ -3,7 +3,6 @@ use crate::rlpx::{
     message::RLPxMessage,
     utils::{snappy_compress, snappy_decompress},
 };
-use bytes::BufMut;
 use ethrex_common::types::BlockHash;
 use ethrex_rlp::{
     error::{RLPDecodeError, RLPEncodeError},
@@ -50,7 +49,7 @@ impl BlockRangeUpdate {
 
 impl RLPxMessage for BlockRangeUpdate {
     const CODE: u8 = 0x11;
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.earliest_block)
@@ -59,7 +58,7 @@ impl RLPxMessage for BlockRangeUpdate {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 

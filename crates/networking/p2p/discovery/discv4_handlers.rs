@@ -14,7 +14,7 @@ use crate::{
         get_msg_expiration_from_seconds, is_msg_expired, node_id, public_key_from_signing_key,
     },
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use ethrex_common::{H256, H512};
 use rand::rngs::OsRng;
 use secp256k1::SecretKey;
@@ -177,7 +177,7 @@ impl DiscoveryServer {
         // Sign one FindNode message for this target
         let expiration = get_msg_expiration_from_seconds(EXPIRATION_SECONDS);
         let msg = Message::FindNode(FindNodeMessage::new(random_pub_key, expiration));
-        let mut buf = BytesMut::new();
+        let mut buf = Vec::new();
         msg.encode_with_header(&mut buf, &self.signer);
 
         let discv4 = self.discv4.as_mut().expect("discv4 state must exist");
@@ -198,7 +198,7 @@ impl DiscoveryServer {
         }
 
         // Collect queries from all active lookups
-        let mut queries: Vec<(usize, H256, Node, BytesMut)> = Vec::new();
+        let mut queries: Vec<(usize, H256, Node, Vec<u8>)> = Vec::new();
         for (idx, (lookup, message)) in discv4.active_lookups.iter_mut().enumerate() {
             for (node_id, node) in lookup.next_to_query(LOOKUP_ALPHA) {
                 queries.push((idx, node_id, node, message.clone()));
@@ -552,7 +552,7 @@ impl DiscoveryServer {
             use ethrex_metrics::p2p::METRICS_P2P;
             METRICS_P2P.inc_discv4_outgoing(message.metric_label());
         }
-        let mut buf = BytesMut::new();
+        let mut buf = Vec::new();
         message.encode_with_header(&mut buf, &self.signer);
         Ok(self.udp_socket.send_to(&buf, addr).await.inspect_err(
             |e| debug!(protocol = "discv4", sending = ?message, addr = ?addr, err=?e, "Error sending message"),
@@ -569,7 +569,7 @@ impl DiscoveryServer {
             use ethrex_metrics::p2p::METRICS_P2P;
             METRICS_P2P.inc_discv4_outgoing(message.metric_label());
         }
-        let mut buf = BytesMut::new();
+        let mut buf = Vec::new();
         message.encode_with_header(&mut buf, &self.signer);
         let message_hash: [u8; 32] = buf[..32]
             .try_into()

@@ -1,4 +1,3 @@
-use bytes::BufMut;
 use ethereum_types::{Address, H256, U256};
 use ethrex_rlp::{decode::RLPDecode, encode::RLPEncode, error::RLPDecodeError};
 use serde::{Deserialize, Serialize};
@@ -21,7 +20,7 @@ pub struct BalanceDiff {
 }
 
 impl RLPEncode for BalanceDiff {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.chain_id.encode(buf);
         self.value.encode(buf);
         self.value_per_token.encode(buf);
@@ -48,7 +47,7 @@ impl RLPDecode for BalanceDiff {
 }
 
 impl RLPEncode for AssetDiff {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.token_l1.encode(buf);
         self.token_src_l2.encode(buf);
         self.token_dst_l2.encode(buf);

@@ -11,7 +11,7 @@ use crate::rlpx::{
     message::RLPxMessage,
     utils::{snappy_compress, snappy_decompress},
 };
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use ethrex_common::{H256, U256, types::AccountStateSlimCodec};
 use ethrex_rlp::{
     decode::RLPDecode,
@@ -43,7 +43,7 @@ pub mod codes {
 impl RLPxMessage for GetAccountRange {
     const CODE: u8 = codes::GET_ACCOUNT_RANGE;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.id)
@@ -54,7 +54,7 @@ impl RLPxMessage for GetAccountRange {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -81,7 +81,7 @@ impl RLPxMessage for GetAccountRange {
 impl RLPxMessage for AccountRange {
     const CODE: u8 = codes::ACCOUNT_RANGE;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.id)
@@ -90,7 +90,7 @@ impl RLPxMessage for AccountRange {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -113,7 +113,7 @@ impl RLPxMessage for AccountRange {
 impl RLPxMessage for GetStorageRanges {
     const CODE: u8 = codes::GET_STORAGE_RANGES;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.id)
@@ -125,7 +125,7 @@ impl RLPxMessage for GetStorageRanges {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -166,7 +166,7 @@ impl RLPxMessage for GetStorageRanges {
 impl RLPxMessage for StorageRanges {
     const CODE: u8 = codes::STORAGE_RANGES;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.id)
@@ -175,7 +175,7 @@ impl RLPxMessage for StorageRanges {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -194,7 +194,7 @@ impl RLPxMessage for StorageRanges {
 impl RLPxMessage for GetByteCodes {
     const CODE: u8 = codes::GET_BYTE_CODES;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.id)
@@ -203,7 +203,7 @@ impl RLPxMessage for GetByteCodes {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -222,7 +222,7 @@ impl RLPxMessage for GetByteCodes {
 impl RLPxMessage for ByteCodes {
     const CODE: u8 = codes::BYTE_CODES;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.id)
@@ -230,7 +230,7 @@ impl RLPxMessage for ByteCodes {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -248,7 +248,7 @@ impl RLPxMessage for ByteCodes {
 impl RLPxMessage for GetTrieNodes {
     const CODE: u8 = codes::GET_TRIE_NODES;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.id)
@@ -258,7 +258,7 @@ impl RLPxMessage for GetTrieNodes {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -283,7 +283,7 @@ impl RLPxMessage for GetTrieNodes {
 impl RLPxMessage for TrieNodes {
     const CODE: u8 = codes::TRIE_NODES;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.id)
@@ -291,7 +291,7 @@ impl RLPxMessage for TrieNodes {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -311,7 +311,7 @@ impl RLPxMessage for TrieNodes {
 // =============================================================================
 
 impl RLPEncode for AccountRangeUnit {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.hash)
             .encode_field(&AccountStateSlimCodec(self.account))
@@ -330,7 +330,7 @@ impl RLPDecode for AccountRangeUnit {
 }
 
 impl RLPEncode for StorageSlot {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.hash)
             .encode_bytes(&self.data.encode_to_vec())

@@ -135,7 +135,7 @@ impl Default for NodeHash {
 
 // Encoded as Vec<u8>
 impl RLPEncode for NodeHash {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         RLPEncode::encode(&Into::<Vec<u8>>::into(self), buf)
     }
 

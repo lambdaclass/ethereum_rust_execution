@@ -536,7 +536,7 @@ impl AuthMessage {
 }
 
 impl RLPEncode for AuthMessage {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.signature)
             .encode_field(&self.public_key)
@@ -592,7 +592,7 @@ impl AckMessage {
 }
 
 impl RLPEncode for AckMessage {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.ephemeral_pubkey)
             .encode_field(&self.nonce)

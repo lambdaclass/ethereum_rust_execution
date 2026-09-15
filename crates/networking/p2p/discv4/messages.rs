@@ -2,7 +2,6 @@ use crate::{
     types::{Endpoint, Node, NodeRecord},
     utils::{current_unix_time, node_id},
 };
-use bytes::BufMut;
 use ethrex_common::{H256, H512, H520, utils::keccak};
 use ethrex_crypto::keccak::keccak_hash;
 use ethrex_rlp::{
@@ -157,7 +156,7 @@ impl Message {
         }
     }
 
-    pub fn encode_with_header(&self, buf: &mut dyn BufMut, node_signer: &SecretKey) {
+    pub fn encode_with_header(&self, buf: &mut Vec<u8>, node_signer: &SecretKey) {
         let signature_size = 65_usize;
         let mut data: Vec<u8> = Vec::with_capacity(signature_size.next_power_of_two());
         data.resize(signature_size, 0);
@@ -174,12 +173,12 @@ impl Message {
         data[signature_size - 1] = Into::<i32>::into(recovery_id) as u8;
 
         let hash = keccak_hash(&data[..]);
-        buf.put_slice(&hash);
-        buf.put_slice(&data[..]);
+        buf.extend_from_slice(&hash);
+        buf.extend_from_slice(&data[..]);
     }
 
-    fn encode_with_type(&self, buf: &mut dyn BufMut) {
-        buf.put_u8(self.packet_type());
+    fn encode_with_type(&self, buf: &mut Vec<u8>) {
+        buf.push(self.packet_type());
         match self {
             Message::Ping(msg) => msg.encode(buf),
             Message::Pong(msg) => msg.encode(buf),
@@ -271,7 +270,7 @@ impl PingMessage {
 }
 
 impl RLPEncode for PingMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         structs::Encoder::new(buf)
             .encode_field(&self.version)
             .encode_field(&self.from)
@@ -299,7 +298,7 @@ impl FindNodeMessage {
 }
 
 impl RLPEncode for FindNodeMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         structs::Encoder::new(buf)
             .encode_field(&self.target)
             .encode_field(&self.expiration)
@@ -404,7 +403,7 @@ impl PongMessage {
 }
 
 impl RLPEncode for PongMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.to)
             .encode_field(&self.ping_hash)
@@ -460,7 +459,7 @@ impl RLPDecode for NeighborsMessage {
 }
 
 impl RLPEncode for NeighborsMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         structs::Encoder::new(buf)
             .encode_field(&self.nodes)
             .encode_field(&self.expiration)
@@ -519,7 +518,7 @@ impl RLPDecode for ENRRequestMessage {
 }
 
 impl RLPEncode for ENRRequestMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         structs::Encoder::new(buf)
             .encode_field(&self.expiration)
             .finish();
@@ -527,7 +526,7 @@ impl RLPEncode for ENRRequestMessage {
 }
 
 impl RLPEncode for ENRResponseMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         structs::Encoder::new(buf)
             .encode_field(&self.request_hash)
             .encode_field(&self.node_record)

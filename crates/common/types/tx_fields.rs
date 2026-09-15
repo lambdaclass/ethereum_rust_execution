@@ -52,7 +52,7 @@ pub struct AuthorizationTuple {
 }
 
 impl RLPEncode for AuthorizationTuple {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.chain_id)
             .encode_field(&self.address)

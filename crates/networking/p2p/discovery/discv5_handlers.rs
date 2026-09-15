@@ -20,7 +20,7 @@ use crate::{
     types::{Node, NodeRecord},
     utils::{distance, node_id},
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use ethrex_common::{H256, H512};
 use rand::{Rng, rngs::OsRng};
 use secp256k1::{PublicKey, SecretKey, ecdsa::Signature};
@@ -826,9 +826,9 @@ impl DiscoveryServer {
         let masking_iv: u128 = rng.r#gen();
         let packet = who_are_you.encode(&nonce, masking_iv.to_be_bytes(), &[0; 16])?;
 
-        let mut raw_buf = BytesMut::new();
+        let mut raw_buf = Vec::new();
         packet.encode(&mut raw_buf, &src_id)?;
-        let raw_bytes = raw_buf.to_vec();
+        let raw_bytes = raw_buf;
 
         let challenge_data = build_challenge_data(
             &masking_iv.to_be_bytes(),
@@ -852,7 +852,7 @@ impl DiscoveryServer {
         dest_id: &H256,
         addr: SocketAddr,
     ) -> Result<(), DiscoveryServerError> {
-        let mut buf = BytesMut::new();
+        let mut buf = Vec::new();
         packet.encode(&mut buf, dest_id)?;
         self.udp_socket.send_to(&buf, addr).await?;
         trace!(protocol = "discv5", to = %dest_id, %addr, flag = packet.header.flag, "Sent packet");

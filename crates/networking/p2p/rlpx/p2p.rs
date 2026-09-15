@@ -3,7 +3,6 @@ use super::{
     utils::{decompress_pubkey, snappy_compress},
 };
 use crate::rlpx::utils::{compress_pubkey, snappy_decompress};
-use bytes::BufMut;
 use ethrex_common::H512;
 use ethrex_rlp::structs::{Decoder, Encoder};
 use ethrex_rlp::{
@@ -86,7 +85,7 @@ impl Capability {
 }
 
 impl RLPEncode for Capability {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.protocol())
             .encode_field(&self.version)
@@ -135,8 +134,8 @@ impl HelloMessage {
 
 impl RLPxMessage for HelloMessage {
     const CODE: u8 = 0x00;
-    fn encode(&self, mut buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
-        Encoder::new(&mut buf)
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
+        Encoder::new(buf)
             .encode_field(&SUPPORTED_P2P_CAPABILITY_VERSION) // protocolVersion
             .encode_field(&self.client_id) // clientId
             .encode_field(&self.capabilities) // capabilities
@@ -297,7 +296,7 @@ impl DisconnectMessage {
 
 impl RLPxMessage for DisconnectMessage {
     const CODE: u8 = 0x01;
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         // Disconnect msg_data is reason or none
         match self.reason.map(Into::<u8>::into) {
@@ -307,7 +306,7 @@ impl RLPxMessage for DisconnectMessage {
             None => Vec::<u8>::new().encode(&mut encoded_data),
         }
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -341,12 +340,12 @@ pub struct PingMessage {}
 
 impl RLPxMessage for PingMessage {
     const CODE: u8 = 0x02;
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         // Ping msg_data is only []
         Vec::<u8>::new().encode(&mut encoded_data);
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -367,12 +366,12 @@ pub struct PongMessage {}
 
 impl RLPxMessage for PongMessage {
     const CODE: u8 = 0x03;
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         // Pong msg_data is only []
         Vec::<u8>::new().encode(&mut encoded_data);
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 

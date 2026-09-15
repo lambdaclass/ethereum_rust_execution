@@ -32,7 +32,11 @@ impl Encoder<Message> for Discv4Codec {
     type Error = PacketDecodeErr;
 
     fn encode(&mut self, message: Message, buf: &mut BytesMut) -> Result<(), Self::Error> {
-        message.encode_with_header(buf, &self.signer);
+        // `encode_with_header` writes into a `Vec<u8>` now, so the framed
+        // `BytesMut` sink needs an extra staging buffer + copy.
+        let mut staging = Vec::new();
+        message.encode_with_header(&mut staging, &self.signer);
+        buf.extend_from_slice(&staging);
         Ok(())
     }
 }

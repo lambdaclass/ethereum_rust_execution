@@ -3,7 +3,6 @@ use crate::rlpx::{
     eth::status::{StatusDataPost68, StatusMessage},
     message::RLPxMessage,
 };
-use bytes::BufMut;
 use ethrex_common::types::{BlockHash, ForkId};
 use ethrex_rlp::error::{RLPDecodeError, RLPEncodeError};
 use ethrex_storage::Store;
@@ -14,7 +13,7 @@ pub struct StatusMessage71(pub(crate) StatusDataPost68);
 impl RLPxMessage for StatusMessage71 {
     const CODE: u8 = 0x00;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         self.0.encode(buf)
     }
 

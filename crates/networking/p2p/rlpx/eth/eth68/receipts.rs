@@ -2,7 +2,7 @@ use crate::rlpx::{
     message::RLPxMessage,
     utils::{snappy_compress, snappy_decompress},
 };
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use ethrex_common::types::{Receipt, TxType};
 use ethrex_rlp::{
     decode::RLPDecode,
@@ -36,10 +36,10 @@ impl RLPEncode for ReceiptItem68 {
     /// Mirrors `ReceiptWithBloom`'s wire encoding:
     /// A) Legacy receipts: `rlp(payload)` (raw list, no Bytes wrap).
     /// B) Non-legacy receipts: `rlp(Bytes(tx_type || rlp(payload)))`.
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         let inner = self.0.encode_inner_with_bloom(&ethrex_crypto::NativeCrypto);
         match self.0.tx_type {
-            TxType::Legacy => buf.put_slice(&inner),
+            TxType::Legacy => buf.extend_from_slice(&inner),
             _ => Bytes::from(inner).encode(buf),
         }
     }
@@ -95,7 +95,7 @@ impl Receipts68 {
 impl RLPxMessage for Receipts68 {
     const CODE: u8 = 0x10;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let wire_receipts: Vec<Vec<ReceiptItem68>> = self
             .receipts
             .iter()
@@ -108,7 +108,7 @@ impl RLPxMessage for Receipts68 {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 

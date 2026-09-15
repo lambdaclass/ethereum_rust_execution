@@ -4,7 +4,6 @@ use crate::rlpx::{
     message::RLPxMessage,
     utils::{snappy_compress, snappy_decompress},
 };
-use bytes::BufMut;
 use ethrex_common::{
     U256,
     types::{BlockHash, ForkId},
@@ -27,7 +26,7 @@ pub struct StatusMessage68 {
 
 impl RLPxMessage for StatusMessage68 {
     const CODE: u8 = 0x00;
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.eth_version)
@@ -39,7 +38,7 @@ impl RLPxMessage for StatusMessage68 {
             .finish();
 
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 

@@ -27,7 +27,7 @@ pub struct FrameReceipt {
 }
 
 impl RLPEncode for FrameReceipt {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.status)
             .encode_field(&self.gas_used)
@@ -306,9 +306,9 @@ pub fn bloom_from_logs(logs: &[Log], crypto: &dyn Crypto) -> Bloom {
 }
 
 impl RLPEncode for Receipt {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         let encoded_inner = self.encode_inner();
-        buf.put_slice(&encoded_inner);
+        buf.extend_from_slice(&encoded_inner);
     }
 }
 
@@ -475,11 +475,11 @@ impl RLPEncode for ReceiptWithBloom {
     /// Receipts can be encoded in the following formats:
     /// A) Legacy receipts: rlp(receipt)
     /// B) Non legacy receipts: rlp(Bytes(tx_type | rlp(receipt))).
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         match self.tx_type {
             TxType::Legacy => {
                 let legacy_encoded = self.encode_inner();
-                buf.put_slice(&legacy_encoded);
+                buf.extend_from_slice(&legacy_encoded);
             }
             _ => {
                 let typed_recepipt_encoded = self.encode_inner();
@@ -572,7 +572,7 @@ pub struct Log {
 }
 
 impl RLPEncode for Log {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.address)
             .encode_field(&self.topics)

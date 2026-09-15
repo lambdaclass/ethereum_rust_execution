@@ -314,7 +314,7 @@ impl BlobsBundle {
 }
 
 impl RLPEncode for BlobsBundle {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         let encoder = Encoder::new(buf);
         encoder
             .encode_field(&self.blobs)

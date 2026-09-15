@@ -3,7 +3,6 @@ use crate::rlpx::{
     message::{Message, RLPxMessage},
     utils::{snappy_compress, snappy_decompress},
 };
-use bytes::BufMut;
 use ethrex_common::utils::keccak;
 use ethrex_common::{
     H256, Signature,
@@ -30,7 +29,7 @@ pub struct NewBlock {
 impl RLPxMessage for NewBlock {
     const CODE: u8 = 0x0;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.block.deref().clone())
@@ -38,7 +37,7 @@ impl RLPxMessage for NewBlock {
             .encode_field(&self.fee_config.to_vec())
             .finish();
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 
@@ -108,7 +107,7 @@ pub fn batch_hash(sealed_batch: &Batch) -> H256 {
 impl RLPxMessage for BatchSealed {
     const CODE: u8 = 0x1;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError> {
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError> {
         let mut encoded_data = vec![];
         Encoder::new(&mut encoded_data)
             .encode_field(&self.batch.number)
@@ -128,7 +127,7 @@ impl RLPxMessage for BatchSealed {
             .encode_field(&self.batch.balance_diffs)
             .finish();
         let msg_data = snappy_compress(encoded_data)?;
-        buf.put_slice(&msg_data);
+        buf.extend_from_slice(&msg_data);
         Ok(())
     }
 

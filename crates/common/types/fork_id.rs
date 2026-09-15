@@ -163,7 +163,7 @@ fn update_checksum(forks: Vec<u64>, hasher: &mut Hasher, head: u64) -> u64 {
 }
 
 impl RLPEncode for ForkId {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.fork_hash)
             .encode_field(&self.fork_next)

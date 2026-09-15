@@ -1,6 +1,6 @@
 use aes::cipher::{KeyIvInit, StreamCipher, StreamCipherError};
 use aes_gcm::{Aes128Gcm, KeyInit, aead::AeadMutInPlace};
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use ethrex_common::H256;
 use ethrex_rlp::{
     decode::RLPDecode,
@@ -92,15 +92,15 @@ impl Packet {
         })
     }
 
-    pub fn encode(&self, buf: &mut dyn BufMut, dest_id: &H256) -> Result<(), PacketCodecError> {
+    pub fn encode(&self, buf: &mut Vec<u8>, dest_id: &H256) -> Result<(), PacketCodecError> {
         let masking_iv = self.masking_iv;
-        buf.put_slice(&masking_iv);
+        buf.extend_from_slice(&masking_iv);
 
         let mut cipher =
             <Aes128Ctr64BE as KeyIvInit>::new(dest_id[..16].into(), masking_iv[..].into());
 
         self.header.encode(buf, &mut cipher)?;
-        buf.put_slice(&self.encrypted_message);
+        buf.extend_from_slice(&self.encrypted_message);
 
         Ok(())
     }
@@ -164,21 +164,21 @@ impl PacketHeader {
 
     fn encode<T: StreamCipher>(
         &self,
-        buf: &mut dyn BufMut,
+        buf: &mut Vec<u8>,
         cipher: &mut T,
     ) -> Result<(), PacketCodecError> {
         let mut static_header = Vec::new();
-        static_header.put_slice(PROTOCOL_ID);
-        static_header.put_slice(&PROTOCOL_VERSION.to_be_bytes());
-        static_header.put_u8(self.flag);
-        static_header.put_slice(&self.nonce);
-        static_header.put_slice(&(self.authdata.len() as u16).to_be_bytes());
+        static_header.extend_from_slice(PROTOCOL_ID);
+        static_header.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        static_header.push(self.flag);
+        static_header.extend_from_slice(&self.nonce);
+        static_header.extend_from_slice(&(self.authdata.len() as u16).to_be_bytes());
         cipher.try_apply_keystream(&mut static_header)?;
-        buf.put_slice(&static_header);
+        buf.extend_from_slice(&static_header);
 
         let mut authdata = self.authdata.clone();
         cipher.try_apply_keystream(&mut authdata)?;
-        buf.put_slice(&authdata);
+        buf.extend_from_slice(&authdata);
 
         Ok(())
     }
@@ -186,7 +186,7 @@ impl PacketHeader {
 
 pub trait PacketTrait {
     const TYPE_FLAG: u8;
-    fn encode_authdata(&self, buf: &mut dyn BufMut) -> Result<(), PacketCodecError>;
+    fn encode_authdata(&self, buf: &mut Vec<u8>) -> Result<(), PacketCodecError>;
     fn get_encoded_message(&self) -> Vec<u8>;
 
     fn build_header(&self, nonce: &[u8; 12]) -> Result<PacketHeader, PacketCodecError> {
@@ -251,8 +251,8 @@ pub struct Ordinary {
 impl PacketTrait for Ordinary {
     const TYPE_FLAG: u8 = 0x00;
 
-    fn encode_authdata(&self, buf: &mut dyn BufMut) -> Result<(), PacketCodecError> {
-        buf.put_slice(self.src_id.as_bytes());
+    fn encode_authdata(&self, buf: &mut Vec<u8>) -> Result<(), PacketCodecError> {
+        buf.extend_from_slice(self.src_id.as_bytes());
         Ok(())
     }
 
@@ -322,9 +322,9 @@ pub struct WhoAreYou {
 impl PacketTrait for WhoAreYou {
     const TYPE_FLAG: u8 = 0x01;
 
-    fn encode_authdata(&self, buf: &mut dyn BufMut) -> Result<(), PacketCodecError> {
-        buf.put_slice(&self.id_nonce.to_be_bytes());
-        buf.put_slice(&self.enr_seq.to_be_bytes());
+    fn encode_authdata(&self, buf: &mut Vec<u8>) -> Result<(), PacketCodecError> {
+        buf.extend_from_slice(&self.id_nonce.to_be_bytes());
+        buf.extend_from_slice(&self.enr_seq.to_be_bytes());
         Ok(())
     }
 
@@ -432,7 +432,7 @@ pub struct Handshake {
 impl PacketTrait for Handshake {
     const TYPE_FLAG: u8 = 0x02;
 
-    fn encode_authdata(&self, buf: &mut dyn BufMut) -> Result<(), PacketCodecError> {
+    fn encode_authdata(&self, buf: &mut Vec<u8>) -> Result<(), PacketCodecError> {
         let sig_size: u8 = self
             .id_signature
             .len()
@@ -444,11 +444,11 @@ impl PacketTrait for Handshake {
             .try_into()
             .map_err(|_| PacketCodecError::InvalidSize)?;
 
-        buf.put_slice(self.src_id.as_bytes());
-        buf.put_u8(sig_size);
-        buf.put_u8(eph_key_size);
-        buf.put_slice(&self.id_signature);
-        buf.put_slice(&self.eph_pubkey);
+        buf.extend_from_slice(self.src_id.as_bytes());
+        buf.push(sig_size);
+        buf.push(eph_key_size);
+        buf.extend_from_slice(&self.id_signature);
+        buf.extend_from_slice(&self.eph_pubkey);
         if let Some(record) = &self.record {
             record.encode(buf);
         }
@@ -532,8 +532,8 @@ impl Message {
         }
     }
 
-    pub fn encode(&self, buf: &mut dyn BufMut) {
-        buf.put_u8(self.msg_type());
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.push(self.msg_type());
         match self {
             Message::Ping(ping) => ping.encode(buf),
             Message::Pong(pong) => pong.encode(buf),
@@ -610,7 +610,7 @@ impl PingMessage {
 }
 
 impl RLPEncode for PingMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.req_id)
             .encode_field(&self.enr_seq)
@@ -636,7 +636,7 @@ pub struct PongMessage {
 }
 
 impl RLPEncode for PongMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.req_id)
             .encode_field(&self.enr_seq)
@@ -673,7 +673,7 @@ pub struct FindNodeMessage {
 }
 
 impl RLPEncode for FindNodeMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.req_id)
             .encode_field(&self.distances)
@@ -705,7 +705,7 @@ pub struct NodesMessage {
 }
 
 impl RLPEncode for NodesMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.req_id)
             .encode_field(&self.total)
@@ -740,7 +740,7 @@ pub struct TalkReqMessage {
 }
 
 impl RLPEncode for TalkReqMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.req_id)
             .encode_field(&self.protocol)
@@ -774,7 +774,7 @@ pub struct TalkResMessage {
 }
 
 impl RLPEncode for TalkResMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.req_id)
             .encode_field(&Bytes::copy_from_slice(&self.response))
@@ -805,7 +805,7 @@ pub struct TicketMessage {
 }
 
 impl RLPEncode for TicketMessage {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.req_id)
             .encode_field(&self.ticket)

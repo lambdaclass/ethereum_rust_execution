@@ -54,7 +54,7 @@ impl Block {
 }
 
 impl RLPEncode for Block {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.header)
             .encode_field(&self.body.transactions)
@@ -223,7 +223,7 @@ impl PartialEq for BlockHeader {
 }
 
 impl RLPEncode for BlockHeader {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.parent_hash)
             .encode_field(&self.ommers_hash)
@@ -407,7 +407,7 @@ pub fn compute_withdrawals_root(withdrawals: &[Withdrawal], crypto: &dyn Crypto)
 }
 
 impl RLPEncode for BlockBody {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.transactions)
             .encode_field(&self.ommers)
@@ -476,7 +476,7 @@ pub struct Withdrawal {
 }
 
 impl RLPEncode for Withdrawal {
-    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         Encoder::new(buf)
             .encode_field(&self.index)
             .encode_field(&self.validator_index)

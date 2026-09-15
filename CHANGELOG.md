@@ -20,6 +20,10 @@
 
 - Make `eth_estimateGas`'s plain-transfer short circuit fire. Its condition tested whether the recipient account existed rather than whether it had code, so every transfer to an ordinary funded wallet ran the full binary search instead of returning `TRANSACTION_GAS` at once [#7211](https://github.com/lambdaclass/ethrex/pull/7211)
 
+### 2026-08-21
+
+- Replace `RLPEncode::encode`'s `&mut dyn BufMut` sink with a concrete `&mut Vec<u8>`, removing a virtual call per encoded field, and write list payloads first so the length prefix is backpatched in place instead of pre-computed by a full `length()` re-encode. Together these drop the per-list scratch allocation `Encoder` used to make and the double traversal of every nested structure: `BlockHeader` -85%, `Receipt` -74%, `EIP1559Transaction` -73%, trie `Node::Leaf` -66%, `Node::Branch` -45% (-22% median across the RLP encode benchmarks) [#7180](https://github.com/lambdaclass/ethrex/pull/7180)
+
 ### 2026-08-03
 
 - Size the default RocksDB shared block cache from the memory the process may actually use — 40% of the smaller of physical memory and the cgroup limit, clamped to 512 MiB..=12 GiB — instead of a flat 12 GiB. The flat default was 71% of a 16 GiB host, leaving no headroom for trie layers, execution and the mempool; `--rocksdb.block-cache-size` still overrides it. Detection reads `/proc`, so outside Linux the default stays at the 12 GiB ceiling; startup logs the detected limit and the resolved size

@@ -1,4 +1,3 @@
-use bytes::BufMut;
 use ethrex_rlp::error::{RLPDecodeError, RLPEncodeError};
 use std::fmt::Display;
 
@@ -84,7 +83,7 @@ impl EthCapVersion {
 pub trait RLPxMessage: Sized {
     const CODE: u8;
 
-    fn encode(&self, buf: &mut dyn BufMut) -> Result<(), RLPEncodeError>;
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<(), RLPEncodeError>;
 
     fn decode(msg_data: &[u8]) -> Result<Self, RLPDecodeError>;
 }
@@ -371,7 +370,7 @@ impl Message {
 
     pub fn encode(
         &self,
-        buf: &mut dyn BufMut,
+        buf: &mut Vec<u8>,
         eth_version: EthCapVersion,
     ) -> Result<(), RLPEncodeError> {
         self.code(eth_version).encode(buf);

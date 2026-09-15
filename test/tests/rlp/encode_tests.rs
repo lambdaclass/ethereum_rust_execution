@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use ethereum_types::{Address, U256};
 use ethrex_rlp::constants::{RLP_EMPTY_LIST, RLP_NULL};
-use ethrex_rlp::encode::RLPEncode;
+use ethrex_rlp::encode::{RLPEncode, backpatch_list_prefix, encode_list_prefix};
 use hex_literal::hex;
 
 #[test]
@@ -340,4 +340,95 @@ fn can_encode_tuple() {
     let expected = vec![0xc0 + 2, 0x01, 0x02];
     assert_eq!(encoded, expected);
     assert_eq!(encoded.len(), tuple.length());
+}
+
+/// `Encoder::finish` and `Vec<T>::encode` write the list prefix *after* the
+/// payload, so the prefix arithmetic has to hold at every size boundary and the
+/// payload has to survive being shifted right to make room.
+///
+/// The expected prefixes are spelled out from the RLP spec rather than derived
+/// from `encode_list_prefix`: both paths share one helper, so comparing them to each
+/// other would not catch a bug in the helper.
+#[test]
+fn backpatched_prefix_matches_the_spec() {
+    // 55/56 is the short/long form boundary; the rest are where the encoded
+    // length itself gains a byte.
+    let cases: &[(usize, &[u8])] = &[
+        (0, &[0xc0]),
+        (1, &[0xc1]),
+        (55, &[0xf7]),
+        (56, &[0xf8, 56]),
+        (57, &[0xf8, 57]),
+        (255, &[0xf8, 0xff]),
+        (256, &[0xf9, 0x01, 0x00]),
+        (257, &[0xf9, 0x01, 0x01]),
+        (65535, &[0xf9, 0xff, 0xff]),
+        (65536, &[0xfa, 0x01, 0x00, 0x00]),
+        (70000, &[0xfa, 0x01, 0x11, 0x70]),
+    ];
+
+    for (payload_len, expected_prefix) in cases {
+        let payload: Vec<u8> = (0..*payload_len).map(|i| (i % 251) as u8).collect();
+
+        let mut backpatched = payload.clone();
+        backpatch_list_prefix(&mut backpatched, 0);
+
+        let mut expected = expected_prefix.to_vec();
+        expected.extend_from_slice(&payload);
+        assert_eq!(
+            backpatched, expected,
+            "backpatched prefix wrong for payload_len {payload_len}"
+        );
+
+        // The write-ahead path has to agree with it, since both encode the same
+        // header.
+        let mut written_ahead = Vec::new();
+        encode_list_prefix(*payload_len, &mut written_ahead);
+        assert_eq!(
+            written_ahead, *expected_prefix,
+            "encode_list_prefix disagrees for payload_len {payload_len}"
+        );
+    }
+}
+
+/// The prefix is inserted at `start`, not at the front of the buffer, so
+/// whatever was already there must be left untouched.
+#[test]
+fn backpatched_prefix_preserves_preceding_bytes() {
+    let preceding = vec![0xde, 0xad, 0xbe, 0xef];
+    for payload_len in [0usize, 55, 56, 300] {
+        let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
+
+        let mut buf = preceding.clone();
+        let start = buf.len();
+        buf.extend_from_slice(&payload);
+        backpatch_list_prefix(&mut buf, start);
+
+        assert_eq!(&buf[..start], &preceding[..]);
+
+        let mut expected_tail = Vec::new();
+        encode_list_prefix(payload_len, &mut expected_tail);
+        expected_tail.extend_from_slice(&payload);
+        assert_eq!(&buf[start..], &expected_tail[..]);
+    }
+}
+
+/// A list long enough to need the long-form prefix, which `can_encode_tuple`
+/// explicitly left uncovered.
+#[test]
+fn can_encode_long_list() {
+    let items: Vec<u64> = (0..100).collect();
+    let mut encoded = Vec::new();
+    items.encode(&mut encoded);
+
+    let payload_len: usize = items.iter().map(|i| i.length()).sum();
+    assert!(payload_len > 55, "expected the long form");
+
+    let mut expected = Vec::new();
+    encode_list_prefix(payload_len, &mut expected);
+    for item in &items {
+        item.encode(&mut expected);
+    }
+    assert_eq!(encoded, expected);
+    assert_eq!(encoded.len(), items.length());
 }

@@ -1,6 +1,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use ethereum_types::U256;
 
@@ -53,51 +53,15 @@ pub const fn bytes_length(bytes_len: usize, first_byte: u8) -> usize {
     1 + be_len as usize + bytes_len // prefix + len(len) + payload
 }
 
-/// Struct implementing `BufMut`, but only counting the number of bytes pushed into the buffer.
-#[derive(Debug, Clone, Copy, Default)]
-struct ByteCounter {
-    count: usize,
-}
-
-unsafe impl BufMut for ByteCounter {
-    fn remaining_mut(&self) -> usize {
-        usize::MAX - self.count
-    }
-
-    unsafe fn advance_mut(&mut self, cnt: usize) {
-        self.count += cnt;
-    }
-
-    fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
-        unreachable!(
-            "shouldn't be reachable since all the functions that call this are reimplemented"
-        )
-    }
-
-    fn put<T: bytes::buf::Buf>(&mut self, src: T)
-    where
-        Self: Sized,
-    {
-        self.count += src.remaining();
-    }
-
-    fn put_bytes(&mut self, _val: u8, cnt: usize) {
-        self.count += cnt;
-    }
-
-    fn put_slice(&mut self, src: &[u8]) {
-        self.count += src.len()
-    }
-}
-
 pub trait RLPEncode {
-    fn encode(&self, buf: &mut dyn BufMut);
+    fn encode(&self, buf: &mut Vec<u8>);
 
     fn length(&self) -> usize {
-        // Run the `encode` function, but only counting the bytes pushed.
-        let mut counter = ByteCounter::default();
-        self.encode(&mut counter);
-        counter.count
+        // Without a polymorphic sink there is no way to count bytes other than
+        // actually encoding them, so this allocates a throwaway buffer.
+        let mut buf = Vec::new();
+        self.encode(&mut buf);
+        buf.len()
     }
 
     fn encode_to_vec(&self) -> Vec<u8> {
@@ -109,11 +73,11 @@ pub trait RLPEncode {
 
 impl RLPEncode for bool {
     #[inline(always)]
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         if *self {
-            buf.put_u8(0x01);
+            buf.push(0x01);
         } else {
-            buf.put_u8(RLP_NULL);
+            buf.push(RLP_NULL);
         }
     }
 
@@ -126,7 +90,7 @@ impl RLPEncode for bool {
 // integer types impls
 
 #[inline]
-fn impl_encode<const N: usize>(value_be: [u8; N], buf: &mut dyn BufMut) {
+fn impl_encode<const N: usize>(value_be: [u8; N], buf: &mut Vec<u8>) {
     // count leading zeros
     let mut i = 0;
     while i < N && value_be[i] == 0 {
@@ -135,7 +99,7 @@ fn impl_encode<const N: usize>(value_be: [u8; N], buf: &mut dyn BufMut) {
 
     // 0, also known as null or the empty string is 0x80
     if i == N {
-        buf.put_u8(RLP_NULL);
+        buf.push(RLP_NULL);
         return;
     }
 
@@ -143,19 +107,20 @@ fn impl_encode<const N: usize>(value_be: [u8; N], buf: &mut dyn BufMut) {
 
     // for a single byte whose value is in the [0x00, 0x7f] range, that byte is its own RLP encoding.
     if i == N - 1 && first <= 0x7f {
-        buf.put_u8(first);
+        buf.push(first);
         return;
     }
 
     // if a string is 0-55 bytes long, the RLP encoding consists of a
     // single byte with value RLP_NULL (0x80) plus the length of the string followed by the string.
     let len = N - i;
-    buf.put_u8(RLP_NULL + len as u8);
-    buf.put_slice(&value_be[i..]);
+    buf.push(RLP_NULL + len as u8);
+    buf.extend_from_slice(&value_be[i..]);
 }
 
 impl RLPEncode for u8 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         impl_encode(self.to_be_bytes(), buf);
     }
 
@@ -166,7 +131,8 @@ impl RLPEncode for u8 {
 }
 
 impl RLPEncode for u16 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         impl_encode(self.to_be_bytes(), buf);
     }
     #[inline]
@@ -176,7 +142,8 @@ impl RLPEncode for u16 {
 }
 
 impl RLPEncode for u32 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         impl_encode(self.to_be_bytes(), buf);
     }
 
@@ -187,7 +154,8 @@ impl RLPEncode for u32 {
 }
 
 impl RLPEncode for u64 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         impl_encode(self.to_be_bytes(), buf);
     }
 
@@ -198,7 +166,8 @@ impl RLPEncode for u64 {
 }
 
 impl RLPEncode for usize {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         impl_encode(self.to_be_bytes(), buf);
     }
 
@@ -209,7 +178,8 @@ impl RLPEncode for usize {
 }
 
 impl RLPEncode for u128 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         impl_encode(self.to_be_bytes(), buf);
     }
 
@@ -220,8 +190,9 @@ impl RLPEncode for u128 {
 }
 
 impl RLPEncode for () {
-    fn encode(&self, buf: &mut dyn BufMut) {
-        buf.put_u8(RLP_NULL);
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
+        buf.push(RLP_NULL);
     }
     #[inline]
     fn length(&self) -> usize {
@@ -231,21 +202,21 @@ impl RLPEncode for () {
 
 impl RLPEncode for [u8] {
     #[inline(always)]
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         if self.len() == 1 && self[0] < RLP_NULL {
-            buf.put_u8(self[0]);
+            buf.push(self[0]);
         } else {
             let len = self.len();
             if len < 56 {
-                buf.put_u8(RLP_NULL + len as u8);
+                buf.push(RLP_NULL + len as u8);
             } else {
                 let bytes = len.to_be_bytes();
                 let start = bytes.iter().position(|&x| x != 0).unwrap();
                 let len = bytes.len() - start;
-                buf.put_u8(0xb7 + len as u8);
-                buf.put_slice(&bytes[start..]);
+                buf.push(0xb7 + len as u8);
+                buf.extend_from_slice(&bytes[start..]);
             }
-            buf.put_slice(self);
+            buf.extend_from_slice(self);
         }
     }
 
@@ -260,7 +231,7 @@ impl RLPEncode for [u8] {
 
 impl<const N: usize> RLPEncode for [u8; N] {
     #[inline]
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_ref().encode(buf)
     }
 
@@ -287,7 +258,7 @@ impl<const N: usize> RLPEncode for [u8; N] {
 
 impl RLPEncode for str {
     #[inline]
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -299,7 +270,7 @@ impl RLPEncode for str {
 
 impl RLPEncode for &str {
     #[inline]
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -311,7 +282,7 @@ impl RLPEncode for &str {
 
 impl RLPEncode for String {
     #[inline]
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -322,12 +293,14 @@ impl RLPEncode for String {
 }
 
 impl RLPEncode for U256 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         let leading_zeros_in_bytes: usize = (self.leading_zeros() / 8) as usize;
         let bytes = self.to_big_endian();
         bytes[leading_zeros_in_bytes..].encode(buf)
     }
 
+    #[inline]
     fn length(&self) -> usize {
         let ilog = self.bits().saturating_sub(1);
         impl_length_integers(ilog as u32, (self.low_u32() & 0xff) as u8)
@@ -336,17 +309,17 @@ impl RLPEncode for U256 {
 
 impl<T: RLPEncode> RLPEncode for Vec<T> {
     #[inline(always)]
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         if self.is_empty() {
-            buf.put_u8(0xc0);
+            buf.push(0xc0);
         } else {
-            let payload_len: usize = self.iter().map(|item| item.length()).sum();
-
-            encode_length(payload_len, buf);
-
+            // Write the payload first and fill the prefix in afterwards: the
+            // `length()` pre-pass this replaces re-encoded every element.
+            let start = buf.len();
             for item in self {
                 item.encode(buf);
             }
+            backpatch_list_prefix(buf, start);
         }
     }
 
@@ -366,21 +339,62 @@ impl<T: RLPEncode> RLPEncode for Vec<T> {
     }
 }
 
+/// Maximum size of a list prefix: the tag plus a `usize` payload length.
+const MAX_LIST_PREFIX_LEN: usize = 1 + size_of::<usize>();
+
+/// Builds the RLP list prefix for a payload of `payload_len` bytes.
+///
+/// Returned by value so that both writing a prefix ahead of a payload
+/// ([`encode_list_prefix`]) and inserting one in front of a payload already written
+/// ([`backpatch_list_prefix`]) share a single implementation.
 #[inline]
-pub fn encode_length(total_len: usize, buf: &mut dyn BufMut) {
-    if total_len < 56 {
-        buf.put_u8(0xc0 + total_len as u8);
-    } else {
-        let bytes = total_len.to_be_bytes();
-        let start = bytes.iter().position(|&x| x != 0).unwrap();
-        let len = bytes.len() - start;
-        buf.put_u8(0xf7 + len as u8);
-        buf.put_slice(&bytes[start..]);
+fn list_prefix(payload_len: usize) -> ([u8; MAX_LIST_PREFIX_LEN], usize) {
+    let mut prefix = [0u8; MAX_LIST_PREFIX_LEN];
+    if payload_len < 56 {
+        prefix[0] = 0xc0 + payload_len as u8;
+        return (prefix, 1);
     }
+    // `payload_len >= 56`, so `ilog2` is defined and there is at least one
+    // significant byte.
+    let be_len = payload_len.ilog2() as usize / 8 + 1;
+    let be = payload_len.to_be_bytes();
+    prefix[0] = 0xf7 + be_len as u8;
+    prefix[1..1 + be_len].copy_from_slice(&be[be.len() - be_len..]);
+    (prefix, 1 + be_len)
+}
+
+/// Appends the list prefix for a payload of `payload_len` bytes, which the
+/// caller is about to write.
+///
+/// Use [`backpatch_list_prefix`] instead when the payload has already been
+/// written and its length was not known up front.
+#[inline]
+pub fn encode_list_prefix(payload_len: usize, buf: &mut Vec<u8>) {
+    let (prefix, prefix_len) = list_prefix(payload_len);
+    buf.extend_from_slice(&prefix[..prefix_len]);
+}
+
+/// Inserts the list prefix for a payload occupying `buf[start..]`, shifting the
+/// payload right to make room.
+///
+/// Lets a list be encoded in one pass: write the payload, then derive the
+/// prefix from how much was written. `start` must be the buffer length recorded
+/// before the payload was written.
+///
+/// # Panics
+///
+/// If `start > buf.len()`.
+#[inline]
+pub fn backpatch_list_prefix(buf: &mut Vec<u8>, start: usize) {
+    let payload_len = buf.len() - start;
+    let (prefix, prefix_len) = list_prefix(payload_len);
+    buf.resize(buf.len() + prefix_len, 0);
+    buf.copy_within(start..start + payload_len, start + prefix_len);
+    buf[start..start + prefix_len].copy_from_slice(&prefix[..prefix_len]);
 }
 
 impl<S: RLPEncode, T: RLPEncode> RLPEncode for (S, T) {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         super::structs::Encoder::new(buf)
             .encode_field(&self.0)
             .encode_field(&self.1)
@@ -395,7 +409,7 @@ impl<S: RLPEncode, T: RLPEncode> RLPEncode for (S, T) {
 }
 
 impl<S: RLPEncode, T: RLPEncode, U: RLPEncode> RLPEncode for (S, T, U) {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         super::structs::Encoder::new(buf)
             .encode_field(&self.0)
             .encode_field(&self.1)
@@ -411,7 +425,7 @@ impl<S: RLPEncode, T: RLPEncode, U: RLPEncode> RLPEncode for (S, T, U) {
 }
 
 impl<S: RLPEncode, T: RLPEncode, U: RLPEncode, V: RLPEncode> RLPEncode for (S, T, U, V) {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         super::structs::Encoder::new(buf)
             .encode_field(&self.0)
             .encode_field(&self.1)
@@ -430,7 +444,7 @@ impl<S: RLPEncode, T: RLPEncode, U: RLPEncode, V: RLPEncode> RLPEncode for (S, T
 impl<S: RLPEncode, T: RLPEncode, U: RLPEncode, V: RLPEncode, W: RLPEncode> RLPEncode
     for (S, T, U, V, W)
 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    fn encode(&self, buf: &mut Vec<u8>) {
         super::structs::Encoder::new(buf)
             .encode_field(&self.0)
             .encode_field(&self.1)
@@ -449,7 +463,8 @@ impl<S: RLPEncode, T: RLPEncode, U: RLPEncode, V: RLPEncode, W: RLPEncode> RLPEn
 }
 
 impl RLPEncode for Ipv4Addr {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.octets().encode(buf)
     }
 
@@ -460,7 +475,8 @@ impl RLPEncode for Ipv4Addr {
 }
 
 impl RLPEncode for Ipv6Addr {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.octets().encode(buf)
     }
 
@@ -471,7 +487,8 @@ impl RLPEncode for Ipv6Addr {
 }
 
 impl RLPEncode for IpAddr {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         match self {
             IpAddr::V4(ip) => ip.encode(buf),
             IpAddr::V6(ip) => ip.encode(buf),
@@ -488,10 +505,12 @@ impl RLPEncode for IpAddr {
 }
 
 impl RLPEncode for Bytes {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_ref().encode(buf)
     }
 
+    #[inline]
     fn length(&self) -> usize {
         self.as_ref().length()
     }
@@ -500,7 +519,8 @@ impl RLPEncode for Bytes {
 // encoding for Ethereum types
 
 impl RLPEncode for ethereum_types::H32 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -511,7 +531,8 @@ impl RLPEncode for ethereum_types::H32 {
 }
 
 impl RLPEncode for ethereum_types::H64 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -522,7 +543,8 @@ impl RLPEncode for ethereum_types::H64 {
 }
 
 impl RLPEncode for ethereum_types::H128 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -533,7 +555,8 @@ impl RLPEncode for ethereum_types::H128 {
 }
 
 impl RLPEncode for ethereum_types::Address {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -544,7 +567,8 @@ impl RLPEncode for ethereum_types::Address {
 }
 
 impl RLPEncode for ethereum_types::H256 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -555,7 +579,8 @@ impl RLPEncode for ethereum_types::H256 {
 }
 
 impl RLPEncode for ethereum_types::H264 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -566,7 +591,8 @@ impl RLPEncode for ethereum_types::H264 {
 }
 
 impl RLPEncode for ethereum_types::H512 {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -577,7 +603,8 @@ impl RLPEncode for ethereum_types::H512 {
 }
 
 impl RLPEncode for ethereum_types::Signature {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.as_bytes().encode(buf)
     }
 
@@ -588,7 +615,8 @@ impl RLPEncode for ethereum_types::Signature {
 }
 
 impl RLPEncode for ethereum_types::Bloom {
-    fn encode(&self, buf: &mut dyn BufMut) {
+    #[inline]
+    fn encode(&self, buf: &mut Vec<u8>) {
         self.0.encode(buf)
     }
 
@@ -599,7 +627,7 @@ impl RLPEncode for ethereum_types::Bloom {
 }
 
 pub trait PayloadRLPEncode {
-    fn encode_payload(&self, buf: &mut dyn bytes::BufMut);
+    fn encode_payload(&self, buf: &mut Vec<u8>);
     fn encode_payload_to_vec(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.encode_payload(&mut buf);

@@ -3,7 +3,6 @@ use crate::{
     discv4::messages::{Message, Packet},
     utils::node_id,
 };
-use bytes::BytesMut;
 use ethrex_common::{H256, H512};
 use std::{collections::HashMap, net::SocketAddr, time::Instant};
 
@@ -16,7 +15,7 @@ pub struct Discv4State {
     /// Used to reject unsolicited Neighbors responses.
     pub pending_find_node: HashMap<H256, Instant>,
     /// Currently active iterative lookups, each with its cached signed FindNode message.
-    pub active_lookups: Vec<(IterativeLookup, BytesMut)>,
+    pub active_lookups: Vec<(IterativeLookup, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]

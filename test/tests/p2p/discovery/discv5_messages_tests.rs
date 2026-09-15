@@ -1,5 +1,5 @@
 use aes_gcm::{Aes128Gcm, KeyInit, aead::AeadMutInPlace};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use ethrex_common::{H256, H264, H512};
 use ethrex_p2p::discv5::{
     messages::{
@@ -89,7 +89,7 @@ fn encode_ping_packet() {
         "00000000000000000000000000000000088b3d4342774649325f313964a39e55ea96c005ad52be8c7560413a7008f16c9e6d2f43bbea8814a546b7409ce783d34c4f53245d08dab84102ed931f66d1492acb308fa1c6715b9d139b81acbdcc"
     );
 
-    let mut buf = BytesMut::new();
+    let mut buf = Vec::new();
     packet.encode(&mut buf, &dest_id).unwrap();
 
     assert_eq!(buf.to_vec(), expected_encoded);
@@ -166,7 +166,7 @@ fn encode_whoareyou_packet() {
         "00000000000000000000000000000000088b3d434277464933a1ccc59f5967ad1d6035f15e528627dde75cd68292f9e6c27d6b66c8100a873fcbaed4e16b8d"
     );
 
-    let mut buf = BytesMut::new();
+    let mut buf = Vec::new();
     packet.encode(&mut buf, &dest_id).unwrap();
 
     assert_eq!(buf.to_vec(), expected_encoded);
@@ -243,7 +243,7 @@ fn encode_ping_handshake_packet() {
         "00000000000000000000000000000000088b3d4342774649305f313964a39e55ea96c005ad521d8c7560413a7008f16c9e6d2f43bbea8814a546b7409ce783d34c4f53245d08da4bb252012b2cba3f4f374a90a75cff91f142fa9be3e0a5f3ef268ccb9065aeecfd67a999e7fdc137e062b2ec4a0eb92947f0d9a74bfbf44dfba776b21301f8b65efd5796706adff216ab862a9186875f9494150c4ae06fa4d1f0396c93f215fa4ef524f1eadf5f0f4126b79336671cbcf7a885b1f8bd2a5d839cf8"
     );
 
-    let mut buf = BytesMut::new();
+    let mut buf = Vec::new();
     packet.encode(&mut buf, &dest_id).unwrap();
 
     assert_eq!(buf.to_vec(), expected_encoded);
@@ -381,7 +381,7 @@ fn encode_ping_handshake_packet_with_enr() {
         "00000000000000000000000000000000088b3d4342774649305f313964a39e55ea96c005ad539c8c7560413a7008f16c9e6d2f43bbea8814a546b7409ce783d34c4f53245d08da4bb23698868350aaad22e3ab8dd034f548a1c43cd246be98562fafa0a1fa86d8e7a3b95ae78cc2b988ded6a5b59eb83ad58097252188b902b21481e30e5e285f19735796706adff216ab862a9186875f9494150c4ae06fa4d1f0396c93f215fa4ef524e0ed04c3c21e39b1868e1ca8105e585ec17315e755e6cfc4dd6cb7fd8e1a1f55e49b4b5eb024221482105346f3c82b15fdaae36a3bb12a494683b4a3c7f2ae41306252fed84785e2bbff3b022812d0882f06978df84a80d443972213342d04b9048fc3b1d5fcb1df0f822152eced6da4d3f6df27e70e4539717307a0208cd208d65093ccab5aa596a34d7511401987662d8cf62b139471"
     );
 
-    let mut buf = BytesMut::new();
+    let mut buf = Vec::new();
     packet.encode(&mut buf, &dest_id).unwrap();
 
     assert_eq!(buf.to_vec(), expected_encoded);
