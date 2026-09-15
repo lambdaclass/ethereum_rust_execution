@@ -45,6 +45,27 @@ impl RpcTransaction {
             transaction_index,
         })
     }
+
+    /// Like [`RpcTransaction::build`] but with the sender provided by the
+    /// caller. `eth_simulateV1` transactions carry zeroed signatures, so the
+    /// sender cannot be recovered from them.
+    pub fn build_with_sender(
+        tx: Transaction,
+        block_number: Option<BlockNumber>,
+        block_hash: Option<BlockHash>,
+        transaction_index: Option<usize>,
+        from: Address,
+    ) -> Self {
+        let hash = tx.hash(&NativeCrypto);
+        RpcTransaction {
+            tx,
+            block_number,
+            block_hash,
+            from,
+            hash,
+            transaction_index: transaction_index.map(|n| n as u64),
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -51,7 +51,13 @@ pub struct Environment {
     /// `ToMessage(_, skipNonceCheck=true)`): the synthetic call may run on top of a
     /// mid-block state (`txIndex`) whose nonce differs from the value the caller
     /// supplied, so enforcing the check would spuriously reject the trace.
+    /// `eth_simulateV1` sets it when `validation: false`, the mode in which the
+    /// method behaves like `eth_call`.
     pub disable_nonce_check: bool,
+    /// When true, emit informational ETH-transfer logs from the
+    /// `TRACE_TRANSFER_ADDRESS` sentinel (`eth_simulateV1` traceTransfers).
+    /// On Amsterdam+ forks the consensus EIP-7708 logs take precedence.
+    pub trace_eth_transfers: bool,
     /// When true, skip the gas limits that gate a transaction's *admission* rather than
     /// its execution: the block-level gas allowance and the EIP-7825 per-transaction cap.
     /// Used by every simulation RPC (eth_call, eth_estimateGas, eth_createAccessList,

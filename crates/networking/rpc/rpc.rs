@@ -44,6 +44,7 @@ use crate::eth::{
     gas_price::GasPrice,
     gas_tip_estimator::GasTipEstimator,
     logs::LogsFilter,
+    simulate::EthSimulateRequest,
     transaction::{
         CallRequest, CreateAccessListRequest, EstimateGasRequest, GetRawTransaction,
         GetRawTransactionByBlockAndIndex, GetTransactionByBlockHashAndIndexRequest,
@@ -425,6 +426,7 @@ fn get_error_kind(err: &RpcErr) -> &'static str {
         RpcErr::InvalidHeaderFormat(_) => "InvalidHeaderFormat",
         RpcErr::InvalidPayload(_) => "InvalidPayload",
         RpcErr::ProofGenerationUnavailable(_) => "ProofGenerationUnavailable",
+        RpcErr::EthSimulate { .. } => "EthSimulate",
         RpcErr::ResourceNotFound(_) => "ResourceNotFound",
         RpcErr::PrunedHistoryUnavailable(_) => "PrunedHistoryUnavailable",
     }
@@ -1446,6 +1448,7 @@ pub async fn map_eth_requests(req: &RpcRequest, context: RpcApiContext) -> Resul
         "eth_createAccessList" => CreateAccessListRequest::call(req, context).await,
         "eth_blockNumber" => BlockNumberRequest::call(req, context).await,
         "eth_call" => CallRequest::call(req, context).await,
+        "eth_simulateV1" => EthSimulateRequest::call(req, context).await,
         "eth_blobBaseFee" => GetBlobBaseFee::call(req, context).await,
         "eth_getTransactionCount" => GetTransactionCountRequest::call(req, context).await,
         "eth_feeHistory" => FeeHistoryRequest::call(req, context).await,

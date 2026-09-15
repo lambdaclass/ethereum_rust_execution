@@ -3,7 +3,7 @@ use ethrex_levm::precompiles::PrecompileMoves;
 use levm::LEVM;
 
 use crate::db::{DynVmDatabase, VmDatabase};
-use crate::errors::EvmError;
+use crate::errors::{EvmError, SimulationTxError};
 use crate::execution_result::ExecutionResult;
 use ethrex_common::types::block_access_list::BlockAccessList;
 use ethrex_common::types::requests::Requests;
@@ -31,6 +31,17 @@ pub struct Evm {
     pub vm_type: VMType,
     pub crypto: Arc<dyn Crypto>,
     pub stateless_validator: Option<Arc<dyn StatelessValidator>>,
+}
+
+/// Per-transaction knobs for `eth_simulateV1` execution
+/// (see [`Evm::execute_tx_simulate`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SimTxConfig {
+    /// `validation` payload flag: when false the tx runs with `eth_call`-like
+    /// relaxed checks (no nonce enforcement, zeroed unpriced blob fees).
+    pub validate: bool,
+    /// `traceTransfers` payload flag: emit informational ETH-transfer logs.
+    pub trace_transfers: bool,
 }
 
 impl core::fmt::Debug for Evm {
@@ -198,6 +209,47 @@ impl Evm {
         }
 
         Ok((receipt, execution_report))
+    }
+
+    /// Like [`Evm::execute_tx`] but for `eth_simulateV1`: validation failures
+    /// are returned structured (see [`SimulationTxError`]) and the simulation
+    /// relaxations from `config` are applied.
+    pub fn execute_tx_simulate(
+        &mut self,
+        tx: &Transaction,
+        block_header: &BlockHeader,
+        cumulative_gas_spent: &mut u64,
+        sender: Address,
+        config: &SimTxConfig,
+    ) -> Result<(Receipt, ExecutionReport), SimulationTxError> {
+        let execution_report = LEVM::execute_tx_for_simulation(
+            tx,
+            sender,
+            block_header,
+            &mut self.db,
+            self.vm_type,
+            self.crypto.as_ref(),
+            config.validate,
+            config.trace_transfers,
+        )?;
+
+        *cumulative_gas_spent += execution_report.gas_spent;
+
+        let receipt = Receipt::new(
+            tx.tx_type(),
+            execution_report.is_success(),
+            *cumulative_gas_spent,
+            execution_report.logs.clone(),
+        );
+
+        Ok((receipt, execution_report))
+    }
+
+    /// Current nonce for `address`, read through the live EVM cache so writes
+    /// from previously executed transactions (same simulated block) are
+    /// visible. Used by `eth_simulateV1` nonce auto-fill.
+    pub fn get_account_nonce(&mut self, address: Address) -> Result<u64, EvmError> {
+        Ok(self.db.get_account(address)?.info.nonce)
     }
 
     pub fn undo_last_tx(&mut self) -> Result<(), EvmError> {

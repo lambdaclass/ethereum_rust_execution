@@ -49,6 +49,7 @@ pub mod mempool;
 pub mod payload;
 pub mod prewarm;
 pub mod sampling;
+pub mod simulate;
 pub mod stateless;
 pub mod tracing;
 pub mod vm;

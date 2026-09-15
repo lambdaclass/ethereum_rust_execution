@@ -8,7 +8,7 @@ use crate::system_contracts::{
     EXPIRY_VERIFIER_PREDEPLOY, EXPIRY_VERIFIER_RUNTIME_BYTECODE, HISTORY_STORAGE_ADDRESS,
     PRAGUE_SYSTEM_CONTRACTS, SYSTEM_ADDRESS, WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS,
 };
-use crate::{EvmError, ExecutionResult};
+use crate::{EvmError, ExecutionResult, SimulationTxError};
 use bytes::Bytes;
 use ethrex_common::H256;
 #[cfg(feature = "rayon")]
@@ -2931,7 +2931,7 @@ impl LEVM {
         block_header: &BlockHeader,
         db: &GeneralizedDatabase,
         vm_type: VMType,
-    ) -> Result<Environment, EvmError> {
+    ) -> Result<Environment, VMError> {
         // `chain_config` (a dyn-dispatch copy) and `EVMConfig`/fork/blob-schedule are
         // block-invariant; in a block loop, compute them once and use
         // `setup_env_with_config` instead. This single-tx entry point computes them here.
@@ -2961,7 +2961,7 @@ impl LEVM {
         chain_id: u64,
         vm_type: VMType,
         base_blob_fee_per_gas: U256,
-    ) -> Result<Environment, EvmError> {
+    ) -> Result<Environment, VMError> {
         let gas_price: U256 = calculate_gas_price_for_tx(
             tx,
             block_header.base_fee_per_gas.unwrap_or_default(),
@@ -2998,6 +2998,7 @@ impl LEVM {
             fee_token: tx.fee_token(),
             disable_balance_check: false,
             disable_nonce_check: false,
+            trace_eth_transfers: false,
             disable_gas_allowance_check: false,
             disable_sender_eoa_check: false,
             is_system_call: false,
@@ -3030,6 +3031,48 @@ impl LEVM {
         )?;
 
         vm.execute().map_err(VMError::into)
+    }
+
+    /// Like [`LEVM::execute_tx`] but for `eth_simulateV1`: validation failures
+    /// come back as structured [`SimulationTxError::Validation`] (the caller
+    /// maps each variant to its spec error code and aborts the request), and
+    /// the simulation relaxations are applied to the environment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_tx_for_simulation(
+        tx: &Transaction,
+        tx_sender: Address,
+        block_header: &BlockHeader,
+        db: &mut GeneralizedDatabase,
+        vm_type: VMType,
+        crypto: &dyn Crypto,
+        validate: bool,
+        trace_eth_transfers: bool,
+    ) -> Result<ExecutionReport, SimulationTxError> {
+        let mut env = Self::setup_env(tx, tx_sender, block_header, db, vm_type)?;
+        // The sender-is-EOA check is always skipped in eth_simulateV1; nonce
+        // enforcement only applies with `validation: true`.
+        env.disable_sender_eoa_check = true;
+        env.disable_nonce_check = !validate;
+        env.trace_eth_transfers = trace_eth_transfers;
+        // With `validation: false` blob fees are zeroed unless the call prices
+        // them explicitly (mirrors `adjust_disabled_base_fee`'s blob branch).
+        if !validate && tx.max_fee_per_blob_gas().unwrap_or_default().is_zero() {
+            env.base_blob_fee_per_gas = U256::zero();
+            env.block_excess_blob_gas = None;
+        }
+        // No stateless validator: simulation answers a query and produces no
+        // EIP-8025 execution proof, matching every other simulation and tracing path.
+        let mut vm = VM::new(
+            env,
+            db,
+            tx,
+            LevmCallTracer::disabled(),
+            vm_type,
+            crypto,
+            None,
+        )?;
+
+        vm.execute().map_err(SimulationTxError::from)
     }
 
     // Like execute_tx but allows reusing the stack pool. Takes the block-invariant
@@ -3929,6 +3972,10 @@ pub(crate) fn env_from_generic(
         // Same reasoning: a simulated call carries no signature, so EIP-3607 has nothing
         // to protect, and a contract as `from` is a normal thing to simulate.
         disable_sender_eoa_check: true,
+        // The eth_call family emits no traceTransfers logs; that relaxation exists for
+        // `eth_simulateV1`, which builds its environment through `setup_env` and opts
+        // in there.
+        trace_eth_transfers: false,
         is_system_call: false,
     })
 }

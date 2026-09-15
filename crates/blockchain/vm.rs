@@ -473,6 +473,196 @@ pub fn synthetic_code(bytecode: Bytes) -> (H256, Code) {
     (hash, code)
 }
 
+/// Accumulated state of an `eth_simulateV1` run: everything that changed since
+/// the base block, across all simulated blocks executed so far (state
+/// overrides materialized as [`AccountUpdate`]s plus each block's execution
+/// results). It is the single source of truth for both reads (via
+/// [`SimulationVmDatabase`]) and per-block state roots (re-applying
+/// `updates_vec()` onto the base block's trie).
+#[derive(Clone, Debug, Default)]
+pub struct SimulationOverlay {
+    /// Cumulative per-address changes, merged with [`Self::merge_update`].
+    updates: BTreeMap<Address, AccountUpdate>,
+    /// Bytecode for overridden and simulation-deployed accounts, by code hash.
+    codes: FxHashMap<H256, Code>,
+    /// Hashes of previously simulated blocks, for `BLOCKHASH`.
+    block_hashes: BTreeMap<BlockNumber, BlockHash>,
+    /// Height of the base (real) block the simulation runs on.
+    base_block_number: BlockNumber,
+}
+
+impl SimulationOverlay {
+    pub fn new(base_block_number: BlockNumber) -> Self {
+        SimulationOverlay {
+            base_block_number,
+            ..Default::default()
+        }
+    }
+
+    /// Merge one more [`AccountUpdate`] into the accumulated set.
+    ///
+    /// [`AccountUpdate::merge`] is not usable here: it neither clears
+    /// accumulated `added_storage` on an incoming `removed`/`removed_storage`
+    /// nor handles re-creation over a destroyed account. Re-creation must not
+    /// keep `removed: true` — the trie application
+    /// (`apply_account_updates_from_trie_batch`) short-circuits on `removed`
+    /// and would drop the new `info` — so it is folded into
+    /// `removed_storage: true` + `info` instead.
+    pub fn merge_update(&mut self, update: AccountUpdate) {
+        if let (Some(info), Some(code)) = (&update.info, &update.code) {
+            self.codes.insert(info.code_hash, code.clone());
+        }
+        let entry = self
+            .updates
+            .entry(update.address)
+            .or_insert_with(|| AccountUpdate::new(update.address));
+        if update.removed {
+            // Destruction voids everything accumulated for the address.
+            *entry = AccountUpdate::removed(update.address);
+        }
+        if update.removed_storage {
+            entry.added_storage.clear();
+            entry.removed_storage = true;
+        }
+        if let Some(info) = update.info {
+            if entry.removed {
+                // Re-created over a tombstone: the account exists again with
+                // its old storage cleared.
+                entry.removed = false;
+                entry.removed_storage = true;
+                entry.added_storage.clear();
+            }
+            entry.info = Some(info);
+        }
+        if let Some(code) = update.code {
+            entry.code = Some(code);
+        }
+        entry.added_storage.extend(update.added_storage);
+    }
+
+    /// Snapshot of the cumulative updates, for state-root computation against
+    /// the base block's trie.
+    pub fn updates_vec(&self) -> Vec<AccountUpdate> {
+        self.updates.values().cloned().collect()
+    }
+
+    /// Record a finalized simulated block's hash so later blocks resolve it
+    /// via `BLOCKHASH`.
+    pub fn insert_block_hash(&mut self, number: BlockNumber, hash: BlockHash) {
+        self.block_hashes.insert(number, hash);
+    }
+
+    pub fn block_hash(&self, number: BlockNumber) -> Option<BlockHash> {
+        self.block_hashes.get(&number).copied()
+    }
+
+    pub fn get_update(&self, address: &Address) -> Option<&AccountUpdate> {
+        self.updates.get(address)
+    }
+}
+
+/// `VmDatabase` for `eth_simulateV1` block chains: reads go through the
+/// cumulative [`SimulationOverlay`] first and fall back to the inner database,
+/// which is opened at the base (real) block. This is how simulated block N+1
+/// observes block N's execution results without committing anything.
+#[derive(Clone)]
+pub struct SimulationVmDatabase<Inner> {
+    inner: Inner,
+    overlay: Arc<SimulationOverlay>,
+}
+
+impl<Inner> SimulationVmDatabase<Inner> {
+    pub fn new(inner: Inner, overlay: Arc<SimulationOverlay>) -> Self {
+        Self { inner, overlay }
+    }
+}
+
+impl<Inner: VmDatabase + Clone> VmDatabase for SimulationVmDatabase<Inner> {
+    fn get_account_state(&self, address: Address) -> Result<Option<AccountState>, EvmError> {
+        let Some(update) = self.overlay.get_update(&address) else {
+            return self.inner.get_account_state(address);
+        };
+        if update.removed {
+            return Ok(None);
+        }
+        let base = self.inner.get_account_state(address)?;
+        let Some(info) = &update.info else {
+            // Storage-only change: account identity is whatever the base says.
+            return Ok(base);
+        };
+        // `info` is the full final state of the account (LEVM emits complete
+        // `AccountInfo`s), so it replaces the base wholesale.
+        let mut state = base.unwrap_or_default();
+        state.balance = info.balance;
+        state.nonce = info.nonce;
+        state.code_hash = info.code_hash;
+        // storage_root is left untouched: the wrapper intercepts
+        // get_storage_slot directly, so the EVM never observes it.
+        Ok(Some(state))
+    }
+
+    fn get_storage_slot(&self, address: Address, key: H256) -> Result<Option<U256>, EvmError> {
+        let Some(update) = self.overlay.get_update(&address) else {
+            return self.inner.get_storage_slot(address, key);
+        };
+        if let Some(value) = update.added_storage.get(&key) {
+            return Ok(Some(*value));
+        }
+        if update.removed || update.removed_storage {
+            // Storage was cleared; slots not re-written read zero.
+            return Ok(Some(U256::zero()));
+        }
+        self.inner.get_storage_slot(address, key)
+    }
+
+    fn get_block_hash(&self, block_number: u64) -> Result<H256, EvmError> {
+        if let Some(hash) = self.overlay.block_hash(block_number) {
+            return Ok(hash);
+        }
+        if block_number <= self.overlay.base_block_number {
+            return self.inner.get_block_hash(block_number);
+        }
+        // Past the head and not simulated (e.g. a gap the caller didn't fill):
+        // zero, mirroring OverlaidVmDatabase.
+        Ok(H256::zero())
+    }
+
+    fn get_chain_config(&self) -> Result<ChainConfig, EvmError> {
+        self.inner.get_chain_config()
+    }
+
+    fn get_account_code(&self, code_hash: H256) -> Result<Code, EvmError> {
+        if code_hash == *EMPTY_KECCAK_HASH {
+            return Ok(Code::default());
+        }
+        if let Some(code) = self.overlay.codes.get(&code_hash) {
+            return Ok(code.clone());
+        }
+        self.inner.get_account_code(code_hash)
+    }
+
+    fn get_code_metadata(&self, code_hash: H256) -> Result<CodeMetadata, EvmError> {
+        if code_hash == *EMPTY_KECCAK_HASH {
+            return Ok(CodeMetadata { length: 0 });
+        }
+        if let Some(code) = self.overlay.codes.get(&code_hash) {
+            return Ok(CodeMetadata {
+                length: code.len() as u64,
+            });
+        }
+        self.inner.get_code_metadata(code_hash)
+    }
+
+    fn code_cache_budget_bytes(&self) -> u64 {
+        // Same as `OverlaidVmDatabase`: this layer holds no bytecode cache, so the
+        // budget is the inner backend's. Nothing reads it on the simulation path yet;
+        // this keeps the fourth wrapper consistent with the other three, so a future
+        // bounded warm cannot silently get the 64 MiB trait default here — which would
+        // override an inner backend reporting zero to stop warming.
+        self.inner.code_cache_budget_bytes()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AccountStateCacheEntry {
     state: AccountState,
@@ -884,12 +1074,13 @@ impl VmDatabase for StoreVmDatabase {
     }
 }
 
+/// Minimal in-memory `VmDatabase` and helpers shared by the overlay/simulation
+/// wrapper tests.
 #[cfg(test)]
-mod overlaid_db_tests {
+mod test_mock_db {
     use super::*;
     use std::sync::Mutex;
 
-    /// Minimal in-memory `VmDatabase` for testing the overlay wrapper in isolation.
     #[derive(Clone, Default)]
     pub(super) struct MockDb {
         pub(super) accounts: Arc<Mutex<BTreeMap<Address, AccountState>>>,
@@ -898,7 +1089,15 @@ mod overlaid_db_tests {
         pub(super) block_hashes: Arc<Mutex<BTreeMap<u64, H256>>>,
     }
 
+    /// Deliberately not the 64 MiB trait default, so a wrapper that forwards
+    /// `code_cache_budget_bytes` is distinguishable from one that does not.
+    pub(super) const MOCK_CODE_CACHE_BUDGET: u64 = 7 * 1024 * 1024;
+
     impl VmDatabase for MockDb {
+        fn code_cache_budget_bytes(&self) -> u64 {
+            MOCK_CODE_CACHE_BUDGET
+        }
+
         fn get_account_state(&self, address: Address) -> Result<Option<AccountState>, EvmError> {
             Ok(self.accounts.lock().unwrap().get(&address).copied())
         }
@@ -947,6 +1146,216 @@ mod overlaid_db_tests {
         bytes[31] = byte;
         H256::from(bytes)
     }
+}
+
+#[cfg(test)]
+mod simulation_db_tests {
+    use super::test_mock_db::{MOCK_CODE_CACHE_BUDGET, MockDb, addr, slot};
+    use super::*;
+    use ethrex_common::types::AccountInfo;
+
+    fn info(balance: u64, nonce: u64, code_hash: H256) -> AccountInfo {
+        AccountInfo {
+            balance: U256::from(balance),
+            nonce,
+            code_hash,
+        }
+    }
+
+    fn update_with_info(address: Address, balance: u64, nonce: u64) -> AccountUpdate {
+        AccountUpdate {
+            address,
+            info: Some(info(balance, nonce, *EMPTY_KECCAK_HASH)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn info_update_replaces_base_wholesale() {
+        let mock = MockDb::default();
+        mock.accounts.lock().unwrap().insert(
+            addr(1),
+            AccountState {
+                balance: U256::from(10),
+                nonce: 7,
+                ..Default::default()
+            },
+        );
+        let mut overlay = SimulationOverlay::new(0);
+        overlay.merge_update(update_with_info(addr(1), 999, 8));
+        let db = SimulationVmDatabase::new(mock, Arc::new(overlay));
+        let state = db.get_account_state(addr(1)).unwrap().unwrap();
+        assert_eq!(state.balance, U256::from(999));
+        assert_eq!(state.nonce, 8);
+    }
+
+    #[test]
+    fn storage_only_update_keeps_base_identity() {
+        let mock = MockDb::default();
+        mock.accounts.lock().unwrap().insert(
+            addr(1),
+            AccountState {
+                nonce: 3,
+                ..Default::default()
+            },
+        );
+        mock.storage
+            .lock()
+            .unwrap()
+            .insert((addr(1), slot(1)), U256::from(11));
+        let mut overlay = SimulationOverlay::new(0);
+        overlay.merge_update(AccountUpdate {
+            address: addr(1),
+            added_storage: [(slot(2), U256::from(22))].into_iter().collect(),
+            ..Default::default()
+        });
+        let db = SimulationVmDatabase::new(mock, Arc::new(overlay));
+        assert_eq!(db.get_account_state(addr(1)).unwrap().unwrap().nonce, 3);
+        // Overlaid slot hits the overlay; untouched slot falls through.
+        assert_eq!(
+            db.get_storage_slot(addr(1), slot(2)).unwrap(),
+            Some(U256::from(22))
+        );
+        assert_eq!(
+            db.get_storage_slot(addr(1), slot(1)).unwrap(),
+            Some(U256::from(11))
+        );
+    }
+
+    #[test]
+    fn removed_account_reads_absent_and_zero_storage() {
+        let mock = MockDb::default();
+        mock.accounts
+            .lock()
+            .unwrap()
+            .insert(addr(1), AccountState::default());
+        mock.storage
+            .lock()
+            .unwrap()
+            .insert((addr(1), slot(1)), U256::from(11));
+        let mut overlay = SimulationOverlay::new(0);
+        // Accumulate some state first; destruction must void it.
+        overlay.merge_update(AccountUpdate {
+            address: addr(1),
+            info: Some(info(5, 1, *EMPTY_KECCAK_HASH)),
+            added_storage: [(slot(2), U256::from(22))].into_iter().collect(),
+            ..Default::default()
+        });
+        overlay.merge_update(AccountUpdate::removed(addr(1)));
+        let db = SimulationVmDatabase::new(mock, Arc::new(overlay.clone()));
+        assert!(db.get_account_state(addr(1)).unwrap().is_none());
+        assert_eq!(
+            db.get_storage_slot(addr(1), slot(1)).unwrap(),
+            Some(U256::zero())
+        );
+        assert_eq!(
+            db.get_storage_slot(addr(1), slot(2)).unwrap(),
+            Some(U256::zero())
+        );
+        // The cumulative update must be a plain tombstone for the trie.
+        let update = overlay.get_update(&addr(1)).unwrap();
+        assert!(update.removed && update.info.is_none() && update.added_storage.is_empty());
+    }
+
+    #[test]
+    fn recreation_over_tombstone_folds_into_removed_storage() {
+        let mock = MockDb::default();
+        mock.storage
+            .lock()
+            .unwrap()
+            .insert((addr(1), slot(1)), U256::from(11));
+        let mut overlay = SimulationOverlay::new(0);
+        overlay.merge_update(AccountUpdate::removed(addr(1)));
+        overlay.merge_update(update_with_info(addr(1), 100, 1));
+        // `removed` must not survive re-creation: the trie application
+        // short-circuits on it and would drop the new info.
+        let update = overlay.get_update(&addr(1)).unwrap();
+        assert!(!update.removed && update.removed_storage);
+        let db = SimulationVmDatabase::new(mock, Arc::new(overlay));
+        let state = db.get_account_state(addr(1)).unwrap().unwrap();
+        assert_eq!(state.balance, U256::from(100));
+        // Pre-destruction storage stays cleared.
+        assert_eq!(
+            db.get_storage_slot(addr(1), slot(1)).unwrap(),
+            Some(U256::zero())
+        );
+    }
+
+    #[test]
+    fn removed_storage_clears_accumulated_slots() {
+        let mut overlay = SimulationOverlay::new(0);
+        overlay.merge_update(AccountUpdate {
+            address: addr(1),
+            added_storage: [(slot(1), U256::from(11))].into_iter().collect(),
+            ..Default::default()
+        });
+        overlay.merge_update(AccountUpdate {
+            address: addr(1),
+            removed_storage: true,
+            added_storage: [(slot(2), U256::from(22))].into_iter().collect(),
+            ..Default::default()
+        });
+        let db = SimulationVmDatabase::new(MockDb::default(), Arc::new(overlay));
+        assert_eq!(
+            db.get_storage_slot(addr(1), slot(1)).unwrap(),
+            Some(U256::zero())
+        );
+        assert_eq!(
+            db.get_storage_slot(addr(1), slot(2)).unwrap(),
+            Some(U256::from(22))
+        );
+    }
+
+    #[test]
+    fn block_hashes_resolve_real_simulated_and_gap() {
+        let mock = MockDb::default();
+        let real = H256::repeat_byte(0xaa);
+        mock.block_hashes.lock().unwrap().insert(90, real);
+        let mut overlay = SimulationOverlay::new(100);
+        let simulated = H256::repeat_byte(0xbb);
+        overlay.insert_block_hash(101, simulated);
+        let db = SimulationVmDatabase::new(mock, Arc::new(overlay));
+        assert_eq!(db.get_block_hash(90).unwrap(), real);
+        assert_eq!(db.get_block_hash(101).unwrap(), simulated);
+        assert_eq!(db.get_block_hash(102).unwrap(), H256::zero());
+    }
+
+    #[test]
+    fn deployed_code_resolves_by_hash() {
+        let (hash, code) = synthetic_code(Bytes::from_static(&[0x60, 0x00]));
+        let mut overlay = SimulationOverlay::new(0);
+        overlay.merge_update(AccountUpdate {
+            address: addr(1),
+            info: Some(info(0, 1, hash)),
+            code: Some(code.clone()),
+            ..Default::default()
+        });
+        let db = SimulationVmDatabase::new(MockDb::default(), Arc::new(overlay));
+        assert_eq!(
+            db.get_account_code(hash).unwrap().code_bytes(),
+            code.code_bytes()
+        );
+        assert_eq!(db.get_code_metadata(hash).unwrap().length, 2);
+    }
+
+    /// The simulation layer holds no bytecode cache, so the budget has to come from
+    /// the backend underneath it. Nothing consumes the value yet, which is exactly why
+    /// this is pinned here: a regression would otherwise be invisible until a bounded
+    /// warm starts reading it, and the default would silently override an inner
+    /// backend reporting zero to stop warming.
+    #[test]
+    fn code_cache_budget_is_the_inner_backend_s() {
+        let db = SimulationVmDatabase::new(MockDb::default(), Arc::new(SimulationOverlay::new(0)));
+        assert_eq!(db.code_cache_budget_bytes(), MOCK_CODE_CACHE_BUDGET);
+        // Without the forward this would be the trait default instead.
+        assert_ne!(db.code_cache_budget_bytes(), 64 * 1024 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod overlaid_db_tests {
+    use super::test_mock_db::{MockDb, addr, slot};
+    use super::*;
 
     #[test]
     fn balance_override_returns_synthetic_balance() {
@@ -1245,7 +1654,7 @@ mod overlaid_db_tests {
 
 #[cfg(test)]
 mod replayed_db_tests {
-    use super::overlaid_db_tests::{MockDb, addr, slot};
+    use super::test_mock_db::{MockDb, addr, slot};
     use super::*;
     use ethrex_common::types::AccountInfo;
 

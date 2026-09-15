@@ -1915,11 +1915,19 @@ impl<'a> VM<'a> {
                 () => {
                     if !frame.value.is_zero() && !value_transfer_reverted {
                         self.transfer(sender, target, frame.value)?;
-                        // EIP-7708 log parity with default_hook::transfer_value:
-                        // only Amsterdam+ and only when sender != target.
-                        if self.env.config.fork >= Fork::Amsterdam && sender != target {
-                            let log =
-                                crate::utils::create_eth_transfer_log(sender, target, frame.value);
+                        // EIP-7708 / traceTransfers log parity with
+                        // default_hook::transfer_value: consensus logs are Amsterdam+ and
+                        // exclude self-transfers, trace mode includes them. Both decisions
+                        // live in `eth_transfer_log_address`.
+                        if let Some(log_address) =
+                            self.eth_transfer_log_address(sender, target, frame.value)
+                        {
+                            let log = crate::utils::create_eth_transfer_log(
+                                log_address,
+                                sender,
+                                target,
+                                frame.value,
+                            );
                             self.substate.add_log(log);
                         }
                     }
@@ -3252,6 +3260,30 @@ impl<'a> VM<'a> {
     /// True if external transaction is a contract creation
     pub fn is_create(&self) -> Result<bool, InternalError> {
         Ok(self.current_call_frame.is_create)
+    }
+
+    /// The address an ETH-transfer log for `value` moving `from` → `to` should
+    /// be emitted from, or `None` when no log applies.
+    /// Amsterdam+ emits consensus EIP-7708 logs from SYSTEM_ADDRESS; the EIP
+    /// excludes self-transfers. Pre-Amsterdam, `eth_simulateV1` traceTransfers
+    /// emits informational logs from the TRACE_TRANSFER_ADDRESS sentinel;
+    /// self-transfers are included there (the tracer reports gross movements).
+    #[inline]
+    pub fn eth_transfer_log_address(
+        &self,
+        from: Address,
+        to: Address,
+        value: U256,
+    ) -> Option<Address> {
+        if value.is_zero() {
+            None
+        } else if self.env.config.fork >= Fork::Amsterdam {
+            (from != to).then_some(ethrex_common::constants::SYSTEM_ADDRESS)
+        } else if self.env.trace_eth_transfers {
+            Some(crate::constants::TRACE_TRANSFER_ADDRESS)
+        } else {
+            None
+        }
     }
 
     /// Executes without making changes to the cache.

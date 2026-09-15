@@ -19,7 +19,7 @@
 use ethrex_common::{
     Address, H256, U256,
     constants::MIN_BASE_FEE_PER_BLOB_GAS,
-    types::{BlockHeader, ChainConfig, fake_exponential},
+    types::{BlockHeader, ChainConfig, Withdrawal, fake_exponential},
 };
 use serde::{Deserialize, Deserializer, de::Error as DeError};
 
@@ -34,13 +34,17 @@ use crate::utils::RpcErr;
 /// and the PascalCase form Go produces from geth's struct. geth renamed
 /// `Coinbase`/`Random` to `FeeRecipient`/`PrevRandao` and calls the blob fee
 /// `BlobBaseFee`; alloy (reth, Foundry) keeps the older spellings as canonical and adds
-/// `baseFee`, and erigon uses `blockNumber`/`timestamp`. All of those are accepted via
-/// `alias` too, so a request shaped for any of those clients works here.
+/// `baseFee`, and erigon uses `blockNumber`/`timestamp`. Every spelling in circulation is
+/// accepted via `alias`, so a request shaped for any of those clients works here. These are
+/// also the `eth_simulateV1` spellings (execution-apis `BlockOverrides`).
 ///
 /// `deny_unknown_fields` mirrors [`StateOverrideSet`](super::state_override::StateOverrideSet):
 /// an override this client cannot honor must be an error rather than a silent drop, which
-/// would return a plausible-looking but wrong result. `beacon_root`, `withdrawals` and
-/// `block_hash` are declared for exactly that reason — see [`BlockOverrideSet::apply_to`].
+/// would return a plausible-looking but wrong result. `block_hash` is declared for exactly
+/// that reason — see [`BlockOverrideSet::apply_to`]. `withdrawals` and `beacon_root` are
+/// the fields whose support depends on the caller: `eth_simulateV1` builds a block and runs
+/// its system calls, so it honors both, while the `eth_call` family has no block to attach
+/// withdrawals to and runs no system contracts, and refuses them.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BlockOverrideSet {
@@ -94,8 +98,11 @@ pub struct BlockOverrideSet {
     pub blob_base_fee_per_gas: Option<U256>,
     #[serde(default, alias = "Difficulty", deserialize_with = "deser_u256_hex_opt")]
     pub difficulty: Option<U256>,
-    /// geth's `BeaconRoot`. Declared only to be refused with a reason: see
-    /// [`BlockOverrideSet::apply_to`].
+    /// geth's `BeaconRoot`. Support depends on the caller, like `withdrawals`:
+    /// `eth_simulateV1` honors it, because that engine runs the block's system calls and
+    /// so writes the value into the EIP-4788 ring buffer; the `eth_call` family refuses it
+    /// in [`BlockOverrideSet::apply_to`], where nothing runs system contracts and the
+    /// value would only reach the header.
     #[serde(
         default,
         alias = "BeaconRoot",
@@ -103,9 +110,13 @@ pub struct BlockOverrideSet {
         alias = "ParentBeaconBlockRoot"
     )]
     pub beacon_root: Option<H256>,
-    /// geth's `Withdrawals`. Declared only to be refused with a reason.
+    /// Withdrawals to apply in the simulated block (balance credits +
+    /// `withdrawalsRoot`). Honored by `eth_simulateV1`, which builds a block; refused by
+    /// [`BlockOverrideSet::apply_to`], since the `eth_call`-family paths have no block to
+    /// attach withdrawals to. Typed rather than opaque because the simulate engine
+    /// actually applies them; geth's `Withdrawals` spelling is accepted too.
     #[serde(default, alias = "Withdrawals")]
-    pub withdrawals: Option<serde_json::Value>,
+    pub withdrawals: Option<Vec<Withdrawal>>,
     /// reth/alloy's `blockHash` extension (a number -> hash map read by `BLOCKHASH`).
     /// Not a geth field. Declared only to be refused with a reason.
     #[serde(default, alias = "BlockHash")]
@@ -125,6 +136,32 @@ impl BlockOverrideSet {
             && self.beacon_root.is_none()
             && self.withdrawals.is_none()
             && self.block_hash.is_none()
+    }
+
+    /// Resolve `blobBaseFee` into the `excess_blob_gas` that produces it
+    /// (ethrex derives BLOBBASEFEE from `excess_blob_gas`). `None` when the
+    /// override is not set.
+    ///
+    /// Used by `eth_simulateV1`, which builds its own header rather than going through
+    /// [`BlockOverrideSet::apply_to`]. Unlike `apply_to` this cannot fail: a fork with no
+    /// blob schedule yields a zero update fraction, for which the inversion returns 0.
+    pub fn resolved_excess_blob_gas(
+        &self,
+        chain_config: &ChainConfig,
+        timestamp: u64,
+    ) -> Option<u64> {
+        let desired = self.blob_base_fee_per_gas?;
+        let denom = chain_config
+            .get_fork_blob_schedule(timestamp)
+            .map(|s| s.base_fee_update_fraction)
+            .unwrap_or(0);
+        // `invert_blob_base_fee` requires a non-zero update fraction (it debug-asserts on
+        // one), so a fork with no blob schedule is resolved here instead: no fraction to
+        // invert against means the minimum blob fee, i.e. zero excess blob gas.
+        if denom == 0 {
+            return Some(0);
+        }
+        Some(invert_blob_base_fee(desired, denom))
     }
 
     /// Produce a synthesized header by overlaying the set fields on top of

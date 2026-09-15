@@ -45,6 +45,9 @@ impl VmDatabase for StateTestVmDatabase {
     fn get_code_metadata(&self, code_hash: H256) -> Result<CodeMetadata, EvmError> {
         self.inner.get_code_metadata(code_hash)
     }
+    fn code_cache_budget_bytes(&self) -> u64 {
+        self.inner.code_cache_budget_bytes()
+    }
 }
 
 /// Loads initial state, used for REVM as it contains RevmState.

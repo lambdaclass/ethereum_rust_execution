@@ -193,10 +193,13 @@ impl<'a> VM<'a> {
         let value = self.current_call_frame.msg_value;
         self.increase_account_balance(new_contract_address, value)?;
 
-        // EIP-7708: Emit transfer log for nonzero-value contract creation transactions.
-        // Origin is sender, new_contract_address is the recipient.
-        if self.env.config.fork >= Fork::Amsterdam && !value.is_zero() {
-            let log = create_eth_transfer_log(self.env.origin, new_contract_address, value);
+        // EIP-7708 / traceTransfers: emit transfer log for nonzero-value contract
+        // creation transactions. Origin is sender, new_contract_address is the recipient.
+        if let Some(log_address) =
+            self.eth_transfer_log_address(self.env.origin, new_contract_address, value)
+        {
+            let log =
+                create_eth_transfer_log(log_address, self.env.origin, new_contract_address, value);
             self.substate.add_log(log);
         }
 

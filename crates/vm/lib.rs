@@ -10,11 +10,21 @@ pub mod backends;
 /// payload builder can enforce it with identical semantics to the validator.
 pub use backends::levm::check_2d_gas_allowance;
 pub use backends::{
-    BlockExecutionResult, Evm, TxGasBreakdown, TxStatus, compute_burned_fees, log_gas_used_mismatch,
+    BlockExecutionResult, Evm, SimTxConfig, TxGasBreakdown, TxStatus, compute_burned_fees,
+    log_gas_used_mismatch,
 };
 pub use db::{DynVmDatabase, VmDatabase};
-pub use errors::EvmError;
+pub use errors::{EvmError, SimulationTxError};
 pub use ethrex_levm::StatelessValidator;
+/// Sentinel emitter address for `eth_simulateV1` traceTransfers logs,
+/// re-exported so callers can filter them out of receipts/blooms.
+pub use ethrex_levm::constants::TRACE_TRANSFER_ADDRESS;
+/// Structured tx-validation failures, re-exported so `eth_simulateV1` can map
+/// each variant to its spec error code.
+pub use ethrex_levm::errors::TxValidationError;
+/// Per-tx execution outcome types, re-exported for `eth_simulateV1` call
+/// result classification.
+pub use ethrex_levm::errors::{ExecutionReport, TxResult};
 pub use ethrex_levm::errors::{InternalError, PrecompileError, VMError};
 pub use ethrex_levm::precompiles::{
     PrecompileCache, PrecompileMoves, is_precompile, precompiles_for_fork,

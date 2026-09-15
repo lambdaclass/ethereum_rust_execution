@@ -15,7 +15,6 @@ use crate::{
 };
 use ExceptionalHalt::OutOfGas;
 use bytes::Bytes;
-use ethrex_common::constants::SYSTEM_ADDRESS;
 use ethrex_common::types::Log;
 use ethrex_common::{
     Address, H256, U256,
@@ -1076,10 +1075,17 @@ pub fn size_offset_to_usize(size: U256, offset: U256) -> Result<(usize, usize), 
 
 // ==================== EIP-7708 Helper Functions ====================
 
-/// Creates EIP-7708 Transfer log (LOG3) for ETH transfers.
-/// Emitted from SYSTEM_ADDRESS when ETH is transferred.
+/// Creates a Transfer log (LOG3) for an ETH transfer, emitted from
+/// `log_address`: SYSTEM_ADDRESS for consensus EIP-7708 logs (Amsterdam+) or
+/// TRACE_TRANSFER_ADDRESS for `eth_simulateV1` traceTransfers. Callers decide
+/// via `VM::eth_transfer_log_address`.
 #[inline]
-pub fn create_eth_transfer_log(from: Address, to: Address, value: U256) -> Log {
+pub fn create_eth_transfer_log(
+    log_address: Address,
+    from: Address,
+    to: Address,
+    value: U256,
+) -> Log {
     let mut from_topic = [0u8; 32];
     from_topic[12..].copy_from_slice(from.as_bytes());
 
@@ -1089,7 +1095,7 @@ pub fn create_eth_transfer_log(from: Address, to: Address, value: U256) -> Log {
     let data = value.to_big_endian();
 
     Log {
-        address: SYSTEM_ADDRESS,
+        address: log_address,
         topics: vec![
             TRANSFER_EVENT_TOPIC,
             H256::from(from_topic),

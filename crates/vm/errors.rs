@@ -1,4 +1,6 @@
-use ethrex_levm::errors::{DatabaseError as LevmDatabaseError, InternalError, VMError};
+use ethrex_levm::errors::{
+    DatabaseError as LevmDatabaseError, InternalError, TxValidationError, VMError,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -29,6 +31,33 @@ impl From<VMError> for EvmError {
             // If an error is not internal it means it is a transaction validation error.
             EvmError::Transaction(value.to_string())
         }
+    }
+}
+
+/// Error type for `eth_simulateV1` transaction execution. Unlike
+/// [`From<VMError> for EvmError`], it keeps validation failures structured so
+/// the RPC layer can map each [`TxValidationError`] variant to its spec error
+/// code (nonce too low/high, base fee too low, insufficient funds, ...).
+#[derive(Debug, Error)]
+pub enum SimulationTxError {
+    #[error("Invalid transaction: {0}")]
+    Validation(TxValidationError),
+    #[error(transparent)]
+    Evm(EvmError),
+}
+
+impl From<VMError> for SimulationTxError {
+    fn from(value: VMError) -> Self {
+        match value {
+            VMError::TxValidation(validation) => SimulationTxError::Validation(validation),
+            other => SimulationTxError::Evm(other.into()),
+        }
+    }
+}
+
+impl From<EvmError> for SimulationTxError {
+    fn from(value: EvmError) -> Self {
+        SimulationTxError::Evm(value)
     }
 }
 

@@ -807,11 +807,11 @@ impl OpcodeHandler for OpSelfDestructHandler {
                 vm.substate.add_selfdestruct(to);
             }
 
-            // EIP-7708: Emit appropriate log for ETH movement (Amsterdam+ only).
-            // EIP-8246 (Amsterdam+): no burn log for same-tx selfdestruct-to-self; no ETH burned.
-            // Cancun/Prague (pre-Amsterdam): no EIP-7708 logs at all.
-            if vm.env.config.fork >= Fork::Amsterdam && !balance.is_zero() && to != beneficiary {
-                let log = create_eth_transfer_log(to, beneficiary, balance);
+            // EIP-7708 / traceTransfers: emit appropriate log for ETH movement.
+            // EIP-8246 (Amsterdam+): no burn log for same-tx selfdestruct-to-self; no ETH
+            // burned, and no consensus log for to == beneficiary (trace mode includes it).
+            if let Some(log_address) = vm.eth_transfer_log_address(to, beneficiary, balance) {
+                let log = create_eth_transfer_log(log_address, to, beneficiary, balance);
                 vm.substate.add_log(log);
                 // No burn log under EIP-8246: selfdestruct-to-self preserves balance.
             }
@@ -825,6 +825,12 @@ impl OpcodeHandler for OpSelfDestructHandler {
             }
 
             vm.substate.add_selfdestruct(to);
+
+            // traceTransfers: pre-Cancun selfdestructs move the balance too.
+            if let Some(log_address) = vm.eth_transfer_log_address(to, beneficiary, balance) {
+                let log = create_eth_transfer_log(log_address, to, beneficiary, balance);
+                vm.substate.add_log(log);
+            }
         }
 
         vm.tracer.enter(
@@ -1050,10 +1056,10 @@ impl<'a> VM<'a> {
         self.substate.push_backup();
         self.substate.add_created_account(new_address); // Mostly for SELFDESTRUCT during initcode.
 
-        // EIP-7708: Emit transfer log for nonzero-value CREATE/CREATE2
+        // EIP-7708 / traceTransfers: emit transfer log for nonzero-value CREATE/CREATE2
         // Must be after push_backup() so the log reverts if the child context reverts
-        if self.env.config.fork >= Fork::Amsterdam && !value.is_zero() {
-            let log = create_eth_transfer_log(deployer, new_address, value);
+        if let Some(log_address) = self.eth_transfer_log_address(deployer, new_address, value) {
+            let log = create_eth_transfer_log(log_address, deployer, new_address, value);
             self.substate.add_log(log);
         }
 
@@ -1259,10 +1265,15 @@ impl<'a> VM<'a> {
             if should_transfer_value && ctx_result.is_success() {
                 self.transfer(msg_sender, to, value)?;
 
-                // EIP-7708: Emit transfer log for nonzero-value CALL/CALLCODE
-                // Self-transfers (msg_sender == to) do NOT emit a log (includes CALLCODE)
-                if self.env.config.fork >= Fork::Amsterdam && !value.is_zero() && msg_sender != to {
-                    let log = create_eth_transfer_log(msg_sender, to, value);
+                // EIP-7708 / traceTransfers: emit transfer log for nonzero-value CALL.
+                // Consensus logs exclude all self-transfers (which covers CALLCODE, where
+                // to == msg_sender); trace mode includes CALL-to-self but still excludes
+                // CALLCODE since its value never leaves the caller's account.
+                let is_callcode = to == msg_sender && code_address != to && !is_delegation_7702;
+                if !is_callcode
+                    && let Some(log_address) = self.eth_transfer_log_address(msg_sender, to, value)
+                {
+                    let log = create_eth_transfer_log(log_address, msg_sender, to, value);
                     self.substate.add_log(log);
                 }
             }
@@ -1308,15 +1319,17 @@ impl<'a> VM<'a> {
 
             self.substate.push_backup();
 
-            // EIP-7708: Emit transfer log for nonzero-value CALL/CALLCODE
-            // Must be after push_backup() so the log reverts if the child context reverts
-            // Self-transfers (msg_sender == to) do NOT emit a log (includes CALLCODE)
+            // EIP-7708 / traceTransfers: emit transfer log for nonzero-value CALL.
+            // Must be after push_backup() so the log reverts if the child context reverts.
+            // Consensus logs exclude all self-transfers (which covers CALLCODE, where
+            // to == msg_sender); trace mode includes CALL-to-self but still excludes
+            // CALLCODE since its value never leaves the caller's account.
+            let is_callcode = to == msg_sender && code_address != to && !is_delegation_7702;
             if should_transfer_value
-                && self.env.config.fork >= Fork::Amsterdam
-                && !value.is_zero()
-                && msg_sender != to
+                && !is_callcode
+                && let Some(log_address) = self.eth_transfer_log_address(msg_sender, to, value)
             {
-                let log = create_eth_transfer_log(msg_sender, to, value);
+                let log = create_eth_transfer_log(log_address, msg_sender, to, value);
                 self.substate.add_log(log);
             }
         }

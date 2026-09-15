@@ -5,6 +5,7 @@ pub(crate) mod client;
 pub(crate) mod fee_market;
 pub(crate) mod filter;
 pub(crate) mod logs;
+pub(crate) mod simulate;
 pub(crate) mod transaction;
 
 pub(crate) mod gas_price;

@@ -160,6 +160,19 @@ fn eip1559_tx_for_test(nonce: u64) -> Transaction {
     })
 }
 
+/// A store on the Amsterdam-activated genesis, for tests that need EIP-7928 (BAL) or
+/// EIP-8037 (2D gas) behaviour. Flipping `amsterdam_time` on [`setup_store`]'s genesis is
+/// not enough: that fixture lacks the Amsterdam system predeploys, so the first
+/// pre-execution system call fails with "has no code after deployment".
+pub async fn setup_store_amsterdam() -> Store {
+    let genesis: &str = include_str!("../../../fixtures/genesis/l1-bal.json");
+    let genesis: Genesis = serde_json::from_str(genesis).expect("Fatal: test config is invalid");
+    let mut store =
+        Store::new("test-store", EngineType::InMemory).expect("Fail to create in-memory db test");
+    store.add_initial_state(genesis).await.unwrap();
+    store
+}
+
 pub async fn setup_store() -> Store {
     let genesis: &str = include_str!("../../../fixtures/genesis/l1.json");
     let genesis: Genesis = serde_json::from_str(genesis).expect("Fatal: test config is invalid");
