@@ -323,13 +323,34 @@ impl NodeRef {
         }
     }
 
+    /// Memoizes this reference's subtrie hash, if there is anything to do.
+    ///
+    /// The guard is deliberately split from the recursive body. A branch node
+    /// visits all 16 of its children, but the vast majority of child references
+    /// are `NodeRef::Hash` or empty slots with nothing to memoize (measured on a
+    /// mainnet block witness: ~93%). Because the body is recursive LLVM will not
+    /// inline it, so keeping the guard in a separate `#[inline]` shell makes the
+    /// overwhelmingly common no-op case a load and a branch at the call site
+    /// instead of a full call.
+    #[inline]
     pub fn memoize_hashes(&self, buf: &mut Vec<u8>, crypto: &dyn Crypto) {
         if let NodeRef::Node(node, hash) = &self
             && hash.get().is_none()
         {
-            node.memoize_hashes(buf, crypto);
-            let _ = hash.set(node.compute_hash_no_alloc(buf, crypto));
+            Self::memoize_hashes_uncached(node, hash, buf, crypto);
         }
+    }
+
+    /// Cold path of [`Self::memoize_hashes`]: this reference is an embedded node
+    /// whose hash is not memoized yet, so descend into it and compute it.
+    fn memoize_hashes_uncached(
+        node: &Arc<Node>,
+        hash: &OnceLock<NodeHash>,
+        buf: &mut Vec<u8>,
+        crypto: &dyn Crypto,
+    ) {
+        node.memoize_hashes(buf, crypto);
+        let _ = hash.set(node.compute_hash_no_alloc(buf, crypto));
     }
 
     /// Resets the memoized hash of this Node
