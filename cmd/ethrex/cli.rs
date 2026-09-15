@@ -981,7 +981,8 @@ pub async fn import_blocks(
     // (e.g. EEST consume-rlp fork-transition fixtures) where each invocation's tail
     // layers are dropped on process exit and the next file's parent state would
     // otherwise be unreachable.
-    crate::initializers::regenerate_head_state(&store, &blockchain)
+    // Offline import: no syncer will run, so an unreachable state is fatal here.
+    crate::initializers::regenerate_head_state(&store, &blockchain, false)
         .await
         .map_err(|e| ChainError::Custom(format!("regenerate_head_state failed: {e}")))?;
     let path_metadata = metadata(path).expect("Failed to read path");
@@ -1108,7 +1109,9 @@ pub async fn import_blocks_bench(
     init_datadir(datadir);
     let store = init_store(datadir, genesis).await?;
     let blockchain = init_blockchain(store.clone(), blockchain_opts);
-    regenerate_head_state(&store, &blockchain).await.unwrap();
+    regenerate_head_state(&store, &blockchain, false)
+        .await
+        .unwrap();
     let path_metadata =
         metadata(path).unwrap_or_else(|e| panic!("failed to stat path {path:?}: {e}"));
 

@@ -930,7 +930,9 @@ pub async fn init_l1(
         },
     );
 
-    regenerate_head_state(&store, &blockchain).await?;
+    // `--syncmode full` opts out of the snap escalation, so an unreachable state stays
+    // fatal for those nodes; see `unreachable_state`.
+    regenerate_head_state(&store, &blockchain, opts.syncmode == SyncMode::Snap).await?;
 
     let signer = get_signer(&datadir);
 
@@ -1148,9 +1150,20 @@ pub fn migrate_datadir_if_needed(
 
 /// Re-apply blocks from the last on-disk state root up to the head block,
 /// rebuilding the in-memory trie diff-layers lost across a restart.
+/// Re-executes the blocks between the newest readable post-state and the canonical
+/// head so the head's state is in memory before the node serves anything.
+///
+/// `snap_permitted` says whether this process can recover from an unreachable state on
+/// its own: a node started with `--syncmode snap` (the default) escalates to snap sync
+/// from `Syncer::sync_cycle` when full sync reports `StateUnrecoverable`. When that is
+/// true and the walk below finds no state to resume from, this returns `Ok(())` and
+/// lets the syncer do it, because failing here kills the process before the syncer ever
+/// runs. Offline callers and `--syncmode full` nodes pass `false`: nothing will recover
+/// for them, so the condition is surfaced instead.
 pub async fn regenerate_head_state(
     store: &Store,
     blockchain: &Arc<Blockchain>,
+    snap_permitted: bool,
 ) -> eyre::Result<()> {
     // Precondition: the store was opened via `add_initial_state`/`load_initial_state`,
     // which clamp `LatestBlockNumber` to `flushed_upto`. All blocks up to
@@ -1193,21 +1206,32 @@ pub async fn regenerate_head_state(
 
     let mut current_last_header = last_header;
 
-    // Find the last block with a known state root
+    // Find the last block with a known state root.
+    //
+    // Two exits mean the same thing: there is no post-state on disk to resume from. The
+    // walk reaches genesis without a hit, or it runs out of headers, which is what an
+    // interrupted snap sync leaves behind (only headers above the pivot are stored).
+    // Both are the condition `Syncer::sync_cycle` already recovers from by escalating to
+    // snap sync, so defer to it rather than exiting.
     while !store.has_state_root(current_last_header.state_root)? {
         if current_last_header.number == 0 {
-            return Err(eyre::eyre!(
-                "Unknown state found in DB. Please run `ethrex removedb` and restart node"
-            ));
+            return unreachable_state(
+                snap_permitted,
+                "walked to genesis without finding a block whose post-state is on disk",
+            );
         }
         let parent_number = current_last_header.number - 1;
 
         debug!("Need to regenerate state for block {parent_number}");
 
         let Some(parent_header) = store.get_block_header(parent_number)? else {
-            return Err(eyre::eyre!(
-                "Parent header for block {parent_number} not found"
-            ));
+            return unreachable_state(
+                snap_permitted,
+                &format!(
+                    "ran out of stored headers at block {parent_number} without finding a \
+                     block whose post-state is on disk"
+                ),
+            );
         };
 
         current_last_header = parent_header;
@@ -1244,6 +1268,34 @@ pub async fn regenerate_head_state(
     info!("Finished regenerating state");
 
     Ok(())
+}
+
+/// Decides what an unreachable state at startup means for this process.
+///
+/// A node that may snap sync recovers in-protocol: `Syncer::sync_cycle` escalates to snap
+/// when full sync reports `StateUnrecoverable`, which is the same condition the startup
+/// walk just hit. Returning `Ok(())` lets the node reach that code. Failing here does not
+/// protect anything: the process exits, is restarted by whatever supervises it, and hits
+/// the identical error, so the node never syncs and the operator is told to delete a
+/// database that the node could have resumed from.
+///
+/// Without snap the node genuinely cannot obtain the missing state in-protocol, and the
+/// snap cycle would wipe retained state the operator chose to keep by passing
+/// `--syncmode full`, so surface it and let them decide.
+fn unreachable_state(snap_permitted: bool, detail: &str) -> eyre::Result<()> {
+    if snap_permitted {
+        warn!(
+            "No reachable state to resume from at startup: {detail}. Snap sync will \
+             recover the missing state; no action is needed."
+        );
+        return Ok(());
+    }
+    Err(eyre::eyre!(
+        "No reachable state to resume from: {detail}. This node runs with `--syncmode \
+         full`, so it will not fetch the missing state via snap sync. Restart with \
+         `--syncmode snap` to recover in-protocol, or run `ethrex removedb` to discard \
+         the database and start over."
+    ))
 }
 
 /// Recovers a database whose canonical head lags the state on disk.
@@ -1500,6 +1552,93 @@ mod interrupted_batch_recovery_tests {
         journal(&store, &genesis);
         assert!(!adopt_committed_head_above(&store, 0).await.unwrap());
         assert_eq!(store.get_latest_block_number().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod unreachable_state_tests {
+    //! What startup does when the downward walk finds no post-state to resume from.
+    //!
+    //! The shape under test is what an interrupted snap sync leaves on disk: headers
+    //! above the pivot and nothing below it, so the walk runs out of headers. A node
+    //! that may snap sync has to reach `Syncer::sync_cycle`, which escalates to snap on
+    //! exactly this condition; exiting at startup instead means it never syncs and
+    //! restarts into the same error forever.
+    use super::{regenerate_head_state, unreachable_state};
+    use ethrex_blockchain::{Blockchain, BlockchainOptions};
+    use ethrex_common::H256;
+    use ethrex_common::types::{BlockHeader, Genesis};
+    use ethrex_storage::{EngineType, Store};
+    use std::sync::Arc;
+
+    /// A store whose canonical head is a header with no readable post-state and no
+    /// stored parent: the walk takes one step and runs out of headers.
+    async fn store_with_head_above_a_gap() -> (Store, Arc<Blockchain>) {
+        let genesis: Genesis =
+            serde_json::from_slice(include_bytes!("../../fixtures/genesis/l1.json")).unwrap();
+        let mut store = Store::new("", EngineType::InMemory).unwrap();
+        store.add_initial_state(genesis).await.unwrap();
+        let genesis_header = store.get_block_header(0).unwrap().unwrap();
+
+        // Sits far above genesis with nothing in between, as a snap pivot does, and
+        // carries a state root that was never written.
+        let head = BlockHeader {
+            hash: Default::default(),
+            number: 5_000,
+            parent_hash: H256::random(),
+            state_root: H256::random(),
+            ..genesis_header
+        };
+        let hash = head.hash();
+        store.add_block_header(hash, head.clone()).await.unwrap();
+        store
+            .forkchoice_update(vec![(head.number, hash)], head.number, hash, None, None)
+            .await
+            .unwrap();
+
+        let blockchain = Arc::new(Blockchain::new(store.clone(), BlockchainOptions::default()));
+        (store, blockchain)
+    }
+
+    #[tokio::test]
+    async fn defers_to_the_syncer_when_snap_is_permitted() {
+        let (store, blockchain) = store_with_head_above_a_gap().await;
+
+        // Must not fail: the node has to get far enough to let snap sync recover.
+        regenerate_head_state(&store, &blockchain, true)
+            .await
+            .expect("startup must defer an unreachable state to the syncer");
+    }
+
+    #[tokio::test]
+    async fn fails_when_the_node_cannot_snap_sync() {
+        let (store, blockchain) = store_with_head_above_a_gap().await;
+
+        let err = regenerate_head_state(&store, &blockchain, false)
+            .await
+            .expect_err("a --syncmode full node cannot recover in-protocol");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--syncmode"),
+            "must name the opt-out that made this fatal: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_recoverable_case_does_not_tell_operators_to_delete_the_database() {
+        assert!(unreachable_state(true, "detail").is_ok());
+
+        // Only the genuinely unrecoverable case may mention it, and it must offer
+        // resuming via snap first.
+        let msg = unreachable_state(false, "detail").unwrap_err().to_string();
+        assert!(
+            msg.contains("--syncmode snap"),
+            "must offer in-protocol recovery: {msg}"
+        );
+        assert!(
+            msg.contains("removedb"),
+            "must still give the operator the escape hatch: {msg}"
+        );
     }
 }
 
