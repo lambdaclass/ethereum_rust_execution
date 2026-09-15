@@ -87,8 +87,7 @@ pub fn new_payload_request_to_block(
         .transactions
         .iter()
         .map(|tx_bytes| {
-            let raw: Vec<u8> = tx_bytes.iter().copied().collect();
-            Transaction::decode_canonical(&raw).map_err(|e| format!("tx decode: {e}"))
+            Transaction::decode_canonical(tx_bytes).map_err(|e| format!("tx decode: {e}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -114,13 +113,13 @@ pub fn new_payload_request_to_block(
     let base_fee_per_gas = base_fee_per_gas_from_le_bytes(&payload.base_fee_per_gas)?;
 
     // Build logs_bloom from SszVector<u8, 256>
-    let bloom_bytes: Vec<u8> = payload.logs_bloom.iter().copied().collect();
-    let logs_bloom = Bloom::from_slice(&bloom_bytes);
+    let logs_bloom = Bloom::from_slice(&payload.logs_bloom);
 
+    let withdrawals_root = compute_withdrawals_root(&withdrawals, crypto);
     let body = BlockBody {
-        transactions: transactions.clone(),
+        transactions,
         ommers: vec![],
-        withdrawals: Some(withdrawals.clone()),
+        withdrawals: Some(withdrawals),
     };
 
     let mut header = BlockHeader {
@@ -136,11 +135,11 @@ pub fn new_payload_request_to_block(
         gas_limit: payload.gas_limit,
         gas_used: payload.gas_used,
         timestamp: payload.timestamp,
-        extra_data: Bytes::from(payload.extra_data.iter().copied().collect::<Vec<u8>>()),
+        extra_data: Bytes::copy_from_slice(&payload.extra_data),
         prev_randao: H256::from_slice(&payload.prev_randao),
         nonce: 0,
         base_fee_per_gas: Some(base_fee_per_gas),
-        withdrawals_root: Some(compute_withdrawals_root(&withdrawals, crypto)),
+        withdrawals_root: Some(withdrawals_root),
         blob_gas_used: Some(payload.blob_gas_used),
         excess_blob_gas: Some(payload.excess_blob_gas),
         parent_beacon_block_root: Some(H256::from_slice(&req.parent_beacon_block_root)),
@@ -159,8 +158,8 @@ pub fn new_payload_request_to_block(
     // field means pre-Amsterdam: leave block_access_list_hash as None.
     if !payload.block_access_list.is_empty() {
         use ethrex_rlp::{decode::RLPDecode, encode::RLPEncode};
-        let bal_bytes: Vec<u8> = payload.block_access_list.iter().copied().collect();
-        let bal = ethrex_common::types::block_access_list::BlockAccessList::decode(&bal_bytes)
+        let bal_bytes: &[u8] = &payload.block_access_list;
+        let bal = ethrex_common::types::block_access_list::BlockAccessList::decode(bal_bytes)
             .map_err(|e| format!("block_access_list decode: {e}"))?;
         // Decoding preserves the wire order while encoding sorts by address, and
         // `compute_hash` re-encodes — so without these two checks a permuted or
@@ -169,10 +168,17 @@ pub fn new_payload_request_to_block(
         // reason (`rpc/engine/payload.rs`); the guest has to reject explicitly.
         bal.validate_ordering()
             .map_err(|e| format!("block_access_list ordering: {e}"))?;
-        if bal.encode_to_vec() != bal_bytes {
+        let encoded = bal.encode_to_vec();
+        if encoded != bal_bytes {
             return Err("block access list is not canonically encoded".to_string());
         }
-        header.block_access_list_hash = Some(bal.compute_hash(crypto));
+        // The check above proved these bytes ARE the canonical encoding, so hash
+        // them rather than have `compute_hash` encode the list a second time.
+        header.block_access_list_hash = Some(
+            ethrex_common::types::block_access_list::BlockAccessList::hash_of_canonical_encoding(
+                &encoded, crypto,
+            ),
+        );
     }
 
     Ok(Block::new(header, body))
@@ -216,7 +222,7 @@ pub fn validate_public_keys(
                     .to_string(),
             ));
         }
-        let hashed = ethrex_common::utils::keccak(xy);
+        let hashed = crypto.keccak256(xy);
         let derived = ethrex_common::Address::from_slice(&hashed[12..]);
         let recovered = tx.sender(crypto).map_err(|e| {
             ExecutionError::Internal(format!("failed to recover transaction sender: {e}"))

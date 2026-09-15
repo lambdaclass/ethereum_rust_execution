@@ -482,26 +482,17 @@ pub struct SszStatelessValidationResult {
 impl SszExecutionWitness {
     /// Extract raw bytes from SSZ lists for codes.
     pub fn codes_as_vecs(&self) -> Vec<Vec<u8>> {
-        self.codes
-            .iter()
-            .map(|c| c.iter().copied().collect())
-            .collect()
+        self.codes.iter().map(|c| c.to_vec()).collect()
     }
 
     /// Extract raw bytes from SSZ lists for headers.
     pub fn headers_as_vecs(&self) -> Vec<Vec<u8>> {
-        self.headers
-            .iter()
-            .map(|h| h.iter().copied().collect())
-            .collect()
+        self.headers.iter().map(|h| h.to_vec()).collect()
     }
 
     /// Extract raw bytes from SSZ lists for state nodes.
     pub fn state_as_vecs(&self) -> Vec<Vec<u8>> {
-        self.state
-            .iter()
-            .map(|n| n.iter().copied().collect())
-            .collect()
+        self.state.iter().map(|n| n.to_vec()).collect()
     }
 }
 

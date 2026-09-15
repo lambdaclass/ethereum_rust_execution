@@ -576,6 +576,16 @@ impl BlockAccessList {
         H256(crypto.keccak256(&buf))
     }
 
+    /// Hash of a block access list whose canonical RLP encoding the caller already
+    /// holds. [`Self::compute_hash`] re-encodes `self` to obtain exactly these bytes,
+    /// so a caller that has proved its wire bytes are canonical -- the stateless
+    /// guest checks precisely that before using them -- can skip the second encode.
+    /// It lives here so the commitment keeps one definition; `same_hash_as_compute_hash`
+    /// pins the two together.
+    pub fn hash_of_canonical_encoding(bytes: &[u8], crypto: &dyn ethrex_crypto::Crypto) -> H256 {
+        H256(crypto.keccak256(bytes))
+    }
+
     /// Builds a validation index for fast per-tx BAL verification.
     /// Call once per block before parallel execution.
     pub fn build_validation_index(&self) -> BalAddressIndex {
@@ -2501,5 +2511,30 @@ mod checkpoint_restore_tests {
         assert_eq!(r.balance_changes[&addr(2)].len(), 1);
         assert_eq!(r.balance_changes[&addr(2)][0].1, U256::from(20));
         assert!(!r.balance_changes.contains_key(&addr(3)));
+    }
+}
+
+#[cfg(test)]
+mod canonical_encoding_hash {
+    use super::*;
+    use ethrex_crypto::NativeCrypto;
+
+    /// The empty list is the case worth pinning: `compute_hash` returns a constant
+    /// there instead of hashing, and the two agree only because that constant is
+    /// keccak of the canonical empty encoding. Should either side of that ever move,
+    /// this fails rather than splitting the commitment in two.
+    #[test]
+    fn same_hash_as_compute_hash() {
+        let crypto = NativeCrypto;
+        let lists = [
+            BlockAccessList::new(),
+            BlockAccessList::from_accounts(vec![AccountChanges::new(Address::repeat_byte(0x11))]),
+        ];
+        for bal in lists {
+            assert_eq!(
+                bal.compute_hash(&crypto),
+                BlockAccessList::hash_of_canonical_encoding(&bal.encode_to_vec(), &crypto),
+            );
+        }
     }
 }
