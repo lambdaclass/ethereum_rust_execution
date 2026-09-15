@@ -78,8 +78,7 @@ fn block_to_ssz_to_block_preserves_hash() {
             prague_time: Some(0),
             ..Default::default()
         },
-        state_trie_root: None,
-        storage_trie_roots: Default::default(),
+        state_nodes: vec![],
     };
 
     // Block → SSZ
@@ -280,8 +279,7 @@ fn producer_emits_one_matching_public_key_per_transaction() {
             prague_time: Some(0),
             ..Default::default()
         },
-        state_trie_root: None,
-        storage_trie_roots: Default::default(),
+        state_nodes: vec![],
     };
 
     let ssz_bytes =

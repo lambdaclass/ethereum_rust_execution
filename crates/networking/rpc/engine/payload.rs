@@ -1706,8 +1706,7 @@ mod tests {
             block_headers_bytes: vec![header_2.encode_to_vec(), header_1.encode_to_vec()],
             first_block_number: 1,
             chain_config: ChainConfig::default(),
-            state_trie_root: None,
-            storage_trie_roots: Default::default(),
+            state_nodes: vec![],
         };
 
         let encoded = encode_witness_for_engine_rpc(witness).unwrap();

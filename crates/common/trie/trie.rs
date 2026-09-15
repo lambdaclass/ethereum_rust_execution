@@ -14,6 +14,7 @@ extern crate alloc;
 
 pub mod db;
 pub mod error;
+
 // Witness recording (Arc<Mutex>) is host-only; the guest verifies against a witness.
 #[cfg(feature = "std")]
 pub mod logger;
@@ -31,6 +32,7 @@ mod trie_iter;
 #[cfg(feature = "std")]
 pub mod trie_sorted;
 mod verify_range;
+pub mod witness_codec;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;

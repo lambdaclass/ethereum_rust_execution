@@ -402,25 +402,26 @@ pub fn build_ssz_stateless_input(
 
 /// Convert internal ExecutionWitness to SSZ format.
 ///
-/// The internal witness has embedded trie structures. The SSZ format
-/// needs flat preimage bytes. We extract the raw node bytes from the
-/// trie nodes, codes, and headers.
+/// The internal witness carries trie nodes as compact witness records
+/// (see `ethrex_trie::witness_codec`); the SSZ wire wants standard node RLP
+/// preimages, canonicalized (sorted, deduplicated).
 fn internal_witness_to_ssz(
     witness: &ethrex_common::types::block_execution_witness::ExecutionWitness,
 ) -> Result<ethrex_common::types::stateless_ssz::SszExecutionWitness, String> {
     use ethrex_common::types::stateless_ssz::SszExecutionWitness;
+    use ethrex_rlp::encode::RLPEncode;
     use libssz_types::SszList;
 
-    // State: encode trie nodes back to their RLP preimage bytes.
-    // The internal witness stores them as embedded Node structures.
-    // We need to flatten them back to raw bytes for SSZ.
-    let mut state_preimages: Vec<Vec<u8>> = Vec::new();
-    if let Some(ref root_node) = witness.state_trie_root {
-        collect_node_preimages(root_node, &mut state_preimages);
-    }
-    for storage_root in witness.storage_trie_roots.values() {
-        collect_node_preimages(storage_root, &mut state_preimages);
-    }
+    let mut state_preimages: Vec<Vec<u8>> = witness
+        .state_nodes
+        .iter()
+        .filter_map(|record| {
+            let (_, node) = ethrex_trie::witness_codec::decode_witness_node(record).ok()?;
+            Some(node.encode_to_vec())
+        })
+        .collect();
+    state_preimages.sort();
+    state_preimages.dedup();
     let state_nodes = state_preimages
         .into_iter()
         .enumerate()
@@ -438,7 +439,7 @@ fn internal_witness_to_ssz(
         .iter()
         .enumerate()
         .map(|(i, code)| {
-            SszList::try_from(code.clone())
+            SszList::try_from(code.to_vec())
                 .map_err(|e| format!("witness codes[{i}] exceeds MAX_WITNESS_CODE_SIZE: {e:?}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -449,7 +450,7 @@ fn internal_witness_to_ssz(
         .iter()
         .enumerate()
         .map(|(i, header_bytes)| {
-            SszList::try_from(header_bytes.clone())
+            SszList::try_from(header_bytes.to_vec())
                 .map_err(|e| format!("witness headers[{i}] exceeds MAX_WITNESS_HEADER_SIZE: {e:?}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -461,31 +462,6 @@ fn internal_witness_to_ssz(
         codes,
         headers,
     })
-}
-
-/// Recursively collect RLP-encoded preimages from a trie Node.
-fn collect_node_preimages(node: &ethrex_trie::Node, preimages: &mut Vec<Vec<u8>>) {
-    use ethrex_rlp::encode::RLPEncode;
-    // Encode the node to its RLP representation
-    let encoded = node.encode_to_vec();
-    preimages.push(encoded);
-
-    // Recurse into children
-    match node {
-        ethrex_trie::Node::Branch(branch) => {
-            for choice in &branch.choices {
-                if let ethrex_trie::NodeRef::Node(child, _) = choice {
-                    collect_node_preimages(child, preimages);
-                }
-            }
-        }
-        ethrex_trie::Node::Extension(ext) => {
-            if let ethrex_trie::NodeRef::Node(child, _) = &ext.child {
-                collect_node_preimages(child, preimages);
-            }
-        }
-        ethrex_trie::Node::Leaf(_) => {} // No children
-    }
 }
 
 #[actor(protocol = NativeL1AdvancerProtocol)]
@@ -637,8 +613,7 @@ mod tests {
                 prague_time: Some(0),
                 ..Default::default()
             },
-            state_trie_root: None,
-            storage_trie_roots: Default::default(),
+            state_nodes: vec![],
         };
 
         // Block → SSZ (no BAL for pre-Amsterdam test block)
@@ -819,8 +794,7 @@ mod tests {
                 amsterdam_time: Some(0),
                 ..Default::default()
             },
-            state_trie_root: None,
-            storage_trie_roots: Default::default(),
+            state_nodes: vec![],
         };
 
         // Block → SSZ with the real BAL passed through.

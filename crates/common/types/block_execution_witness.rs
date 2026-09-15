@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
-use crate::rkyv_utils::H256Wrapper;
 use crate::serde_utils;
 use crate::types::{Block, Code, CodeMetadata};
 use crate::{
@@ -14,8 +13,10 @@ use ethrex_crypto::Crypto;
 use ethrex_rlp::error::RLPDecodeError;
 use ethrex_rlp::structs::{Decoder, Encoder};
 use ethrex_rlp::{decode::RLPDecode, encode::RLPEncode};
+use ethrex_trie::witness_codec::{
+    decode_subtree_records, decode_witness_node, encode_subtree_records,
+};
 use ethrex_trie::{EMPTY_TRIE_HASH, FxHashMap, Nibbles, Node, NodeRef, Trie, TrieError};
-use rkyv::with::{Identity, MapKV};
 use serde::{Deserialize, Serialize};
 
 /// State produced by the guest program execution inside the zkVM. It is
@@ -75,12 +76,11 @@ pub struct ExecutionWitness {
     pub first_block_number: u64,
     // The chain config.
     pub chain_config: ChainConfig,
-    /// Root node embedded with the rest of the trie's nodes
-    pub state_trie_root: Option<Node>,
-    /// Root nodes per account storage embedded with the rest of the trie's nodes,
-    /// keyed by the keccak256 hash of the account address.
-    #[rkyv(with = MapKV<H256Wrapper, Identity>)]
-    pub storage_trie_roots: BTreeMap<H256, Node>,
+    /// Trie nodes as DFS pre-order witness records (see
+    /// `ethrex_trie::witness_codec`): state trie first, then every referenced
+    /// storage trie. The guest rebuilds the tries straight from the stream.
+    #[rkyv(with = crate::rkyv_utils::VecVecWrapper)]
+    pub state_nodes: Vec<Vec<u8>>,
 }
 
 /// RPC-friendly representation of an execution witness.
@@ -117,18 +117,20 @@ impl TryFrom<ExecutionWitness> for RpcExecutionWitness {
     type Error = TrieError;
 
     fn try_from(value: ExecutionWitness) -> Result<Self, Self::Error> {
-        let mut nodes = Vec::new();
-        if let Some(state_trie_root) = value.state_trie_root {
-            state_trie_root.encode_subtrie(&mut nodes)?;
-        }
-        for node in value.storage_trie_roots.values() {
-            node.encode_subtrie(&mut nodes)?;
-        }
         // Canonical witness ordering (EIP-8025, geth `ExtWitness`): state nodes
         // and codes sorted lexicographically and deduplicated (identical
         // storage subtries would otherwise emit identical nodes twice); headers
         // ascending by block number and deduplicated (the same ancestor header
-        // can be referenced by more than one block).
+        // can be referenced by more than one block). Records are converted back
+        // to standard node RLP for the RPC wire.
+        let mut nodes: Vec<Vec<u8>> = value
+            .state_nodes
+            .iter()
+            .filter_map(|record| {
+                let (_, node) = decode_witness_node(record).ok()?;
+                Some(node.encode_to_vec())
+            })
+            .collect();
         nodes.sort();
         nodes.dedup();
         let mut codes = value.codes;
@@ -200,7 +202,10 @@ impl RLPDecode for ExtWitness {
 
 impl RpcExecutionWitness {
     /// Convert an RPC execution witness into the internal [`ExecutionWitness`]
-    /// format by rebuilding trie structures from the flat node list.
+    /// format. Host-side: the flat node RLPs are rebuilt into embedded tries
+    /// and re-emitted as DFS pre-order witness records (see
+    /// `ethrex_trie::witness_codec`); the guest rebuilds the tries straight
+    /// from the stream (see [`GuestProgramState::from_witness`]).
     /// `decoded_headers` is reused (typically from [`decode_witness_headers`])
     /// to avoid a second RLP decode.
     pub fn into_execution_witness(
@@ -211,70 +216,93 @@ impl RpcExecutionWitness {
         crypto: &dyn Crypto,
     ) -> Result<ExecutionWitness, GuestProgramStateError> {
         let initial_state_root = find_parent_state_root(decoded_headers, first_block_number)?;
-        // Drop the `0x80` Null-node sentinel some `debug_executionWitness` producers emit.
-        // Undecodable/unused nodes are dropped per EELS
-        // `test_validation_state_extra_unused_trie_node`; missing needed nodes surface
-        // later as `RootNotFound` from `get_embedded_root_committed`.
-        let nodes: FxHashMap<H256, Node> = self
-            .state
-            .into_iter()
-            .filter_map(|b| {
-                if b == Bytes::from_static(&[0x80]) {
-                    return None;
-                }
-                let node = Node::decode(&b).ok()?;
-                Some((H256(crypto.keccak256(&b)), node))
-            })
-            .collect();
-
-        // get state trie root and embed the rest of the trie into it
-        let state_trie_root = if let NodeRef::Node(state_trie_root, _) =
-            Trie::get_embedded_root_committed(&nodes, initial_state_root, crypto)?
-        {
-            Some((*state_trie_root).clone())
-        } else {
-            None
-        };
-
-        // Walk the state trie to discover accounts and their storage roots,
-        // instead of relying on the keys field which is being removed from the RPC spec.
-        let mut storage_trie_roots = BTreeMap::new();
-        if let Some(state_trie_root) = &state_trie_root {
-            let mut accounts = Vec::new();
-            collect_accounts_from_trie(
-                state_trie_root,
-                Nibbles::from_raw(&[], false),
-                &mut accounts,
-                &nodes,
-                crypto,
-            );
-
-            for (hashed_address, storage_root_hash) in accounts {
-                if storage_root_hash == EMPTY_TRIE_HASH {
-                    continue;
-                }
-                if !nodes.contains_key(&storage_root_hash) {
-                    continue;
-                }
-                let node = Trie::get_embedded_root_committed(&nodes, storage_root_hash, crypto)?;
-                let NodeRef::Node(node, _) = node else {
-                    return Err(GuestProgramStateError::Custom(
-                        "execution witness does not contain non-empty storage trie".to_string(),
-                    ));
-                };
-                storage_trie_roots.insert(hashed_address, (*node).clone());
-            }
-        }
-
+        let nodes = node_map_from_rlp(self.state.iter());
+        let state_nodes = witness_records_from_node_map(&nodes, initial_state_root, crypto)?;
         Ok(ExecutionWitness {
             codes: self.codes.into_iter().map(|b| b.to_vec()).collect(),
             chain_config,
             first_block_number,
             block_headers_bytes: self.headers.into_iter().map(|b| b.to_vec()).collect(),
-            state_trie_root,
-            storage_trie_roots,
+            state_nodes,
         })
     }
+}
+
+/// Decode flat trie-node RLP preimages into the hash-keyed node map, dropping
+/// the `0x80` Null-node sentinel and undecodable entries (spec-tolerated
+/// unused nodes). Host-side.
+fn node_map_from_rlp<'a, B: AsRef<[u8]> + 'a>(
+    rlp_nodes: impl Iterator<Item = &'a B>,
+) -> FxHashMap<H256, Node> {
+    rlp_nodes
+        .filter(|b| b.as_ref() != [0x80])
+        .filter_map(|b| {
+            let b = b.as_ref();
+            let node = Node::decode(b).ok()?;
+            Some((H256(ethrex_crypto::keccak::keccak_hash(b)), node))
+        })
+        .collect()
+}
+
+/// Emit the state trie and every referenced storage trie as DFS pre-order
+/// witness records. Host-side: rebuilds the embedded tries from the node map
+/// (hash-seeded via `get_embedded_root_committed`) and walks them.
+pub fn witness_records_from_node_map(
+    nodes: &FxHashMap<H256, Node>,
+    initial_state_root: H256,
+    crypto: &dyn Crypto,
+) -> Result<Vec<Vec<u8>>, GuestProgramStateError> {
+    let mut records = Vec::new();
+    let state_root = match Trie::get_embedded_root_committed(nodes, initial_state_root, crypto)? {
+        NodeRef::Node(root, _) => Some(root),
+        _ => None,
+    };
+    if let Some(root) = &state_root {
+        encode_subtree_records(root, &initial_state_root, &mut records);
+        // Distinct storage roots only: accounts can share an identical storage
+        // trie, and the guest binds each shipped subtree to every account whose
+        // storage root matches it.
+        let mut emitted_roots = BTreeSet::new();
+        for (_hashed_address, storage_root_hash) in
+            collect_accounts_from_embedded_trie(root, nodes, crypto)
+        {
+            if storage_root_hash == EMPTY_TRIE_HASH
+                || !nodes.contains_key(&storage_root_hash)
+                || !emitted_roots.insert(storage_root_hash)
+            {
+                continue;
+            }
+            let node = Trie::get_embedded_root_committed(nodes, storage_root_hash, crypto)?;
+            let NodeRef::Node(node, _) = node else {
+                return Err(GuestProgramStateError::Custom(
+                    "execution witness does not contain non-empty storage trie".to_string(),
+                ));
+            };
+            encode_subtree_records(&node, &storage_root_hash, &mut records);
+        }
+    }
+    Ok(records)
+}
+
+/// Locate the parent block's state root from a slice of decoded headers.
+/// Returns an error if `first_block_number == 0` (no parent possible) or if the
+/// parent header is not in the slice.
+fn find_parent_state_root(
+    headers: &[BlockHeader],
+    first_block_number: u64,
+) -> Result<H256, GuestProgramStateError> {
+    let parent_number = first_block_number
+        .checked_sub(1)
+        .ok_or(GuestProgramStateError::Custom(
+            "first_block_number must be > 0 (need parent header)".to_string(),
+        ))?;
+    headers
+        .iter()
+        .find(|h| h.number == parent_number)
+        .map(|h| h.state_root)
+        .ok_or_else(|| {
+            GuestProgramStateError::Custom(format!("header for block {parent_number} not found"))
+        })
 }
 
 impl ExecutionWitness {
@@ -307,90 +335,84 @@ impl ExecutionWitness {
         validate_witness_headers_chain(&headers, crypto)?;
 
         let initial_state_root = find_parent_state_root(&headers, first_block_number)?;
-
-        let (state_trie_root, storage_trie_roots) = rebuild_state_and_storage_tries(
-            input.witness.state_as_vecs(),
-            initial_state_root,
-            crypto,
-        )?;
+        let nodes = node_map_from_rlp(input.witness.state_as_vecs().iter());
+        let state_nodes = witness_records_from_node_map(&nodes, initial_state_root, crypto)?;
 
         Ok(Self {
             codes: input.witness.codes_as_vecs(),
             block_headers_bytes,
             first_block_number,
             chain_config: amsterdam_chain_config(input.chain_id),
-            state_trie_root,
-            storage_trie_roots,
+            state_nodes,
         })
     }
 }
 
-/// Rebuild the embedded state trie and per-account storage tries from a flat
-/// list of trie-node preimages (same format as `debug_executionWitness.state`
-/// and SSZ `ExecutionWitness.state`).
-fn rebuild_state_and_storage_tries<I, B>(
-    state_bytes: I,
+/// Build the state trie and per-account storage tries straight from the DFS
+/// record stream (guest side). No node map and no embedding pass: each record
+/// links to its children by stream position, and every rebuilt node is
+/// hash-seeded, so the returned tries need no upfront `hash_no_commit`. The
+/// state root is anchored to `initial_state_root` (the parent header's state
+/// root); storage subtries are bound to their accounts by matching each
+/// subtree's shipped root hash against the accounts found in the state leaves
+/// (several accounts can share one storage trie, so one subtree can bind to
+/// more than one hashed address).
+fn build_tries_from_records(
+    records: &[Vec<u8>],
     initial_state_root: H256,
-    crypto: &dyn Crypto,
-) -> Result<(Option<Node>, BTreeMap<H256, Node>), GuestProgramStateError>
-where
-    I: IntoIterator<Item = B>,
-    B: AsRef<[u8]>,
-{
-    // `crypto`, not the free `keccak`: on RISC-V the latter falls through to the
-    // software `tiny_keccak` (see `ethrex_crypto::keccak`), so hashing every witness
-    // node here would bypass the zkVM's accelerated keccak in the guest.
-    let nodes: FxHashMap<H256, Node> = state_bytes
-        .into_iter()
-        .filter_map(|b| {
-            let bytes = b.as_ref();
-            // An entry that does not decode as a trie node is skipped rather
-            // than rejected. Witnesses legitimately carry such entries: the
-            // `Null` node (single byte 0x80) some `debug_executionWitness`
-            // implementations emit, and unused nodes the spec explicitly
-            // tolerates (`test_validation_state_extra_unused_trie_node`).
-            //
-            // Skipping is safe because it only makes a node unavailable. If the
-            // trie walk actually needs it, `get_embedded_root` fails there — the
-            // correct place to reject — and the post-execution state-root check
-            // still binds the result either way. Hard-failing here rejected
-            // witnesses the spec accepts.
-            Some((H256(crypto.keccak256(bytes)), Node::decode(bytes).ok()?))
-        })
-        .collect();
+) -> Result<(Trie, BTreeMap<H256, Trie>), GuestProgramStateError> {
+    let mut pos = 0;
+    if initial_state_root == EMPTY_TRIE_HASH {
+        return Ok((Trie::new_temp(), BTreeMap::new()));
+    }
+    let mut leaves = Vec::new();
+    let (state_root_ref, root_hash) =
+        decode_subtree_records(records, &mut pos, &Nibbles::default(), Some(&mut leaves))
+            .map_err(TrieError::from)?;
+    if root_hash != initial_state_root {
+        return Err(GuestProgramStateError::Custom(format!(
+            "witness state trie root {root_hash} does not match the parent header's state root {initial_state_root}"
+        )));
+    }
+    let state_trie = Trie::new_temp_with_root(state_root_ref);
 
-    // `_committed` pre-seeds each node's hash slot, so later hashing of the subtree
-    // reuses the known value instead of re-encoding and re-hashing the whole trie.
-    // Sound here because `nodes` is keyed by the hash of the very bytes it decodes.
-    let state_trie_root = if let NodeRef::Node(state_trie_root, _) =
-        Trie::get_embedded_root_committed(&nodes, initial_state_root, crypto)?
-    {
-        Some((*state_trie_root).clone())
-    } else {
-        None
-    };
-
-    // Walk the state trie to discover accounts and their storage roots,
-    // instead of relying on the keys field which is being removed from the
-    // RPC spec.
-    let mut storage_trie_roots = BTreeMap::new();
-    if let Some(root) = &state_trie_root {
-        let accounts = collect_accounts_from_embedded_trie(root, &nodes, crypto);
-        for (hashed_address, storage_root_hash) in accounts {
-            if storage_root_hash == EMPTY_TRIE_HASH || !nodes.contains_key(&storage_root_hash) {
-                continue;
-            }
-            let node = Trie::get_embedded_root_committed(&nodes, storage_root_hash, crypto)?;
-            let NodeRef::Node(node, _) = node else {
-                return Err(GuestProgramStateError::Custom(
-                    "execution witness does not contain non-empty storage trie".to_string(),
-                ));
-            };
-            storage_trie_roots.insert(hashed_address, (*node).clone());
+    // Map each account's storage root to its hashed addresses (from the state
+    // leaves just built) so storage subtries can be bound to their accounts.
+    // Accounts can share an identical storage trie, so one root can key
+    // several addresses; the host ships each distinct root's subtree once.
+    let mut storage_by_root: FxHashMap<H256, Vec<H256>> = FxHashMap::default();
+    for (path, value) in &leaves {
+        let path_bytes = path.to_bytes();
+        if path_bytes.len() != 32 {
+            continue;
+        }
+        if let Ok(account_state) = AccountState::decode(value)
+            && account_state.storage_root != EMPTY_TRIE_HASH
+        {
+            storage_by_root
+                .entry(account_state.storage_root)
+                .or_default()
+                .push(H256::from_slice(&path_bytes));
         }
     }
 
-    Ok((state_trie_root, storage_trie_roots))
+    let mut storage_tries = BTreeMap::new();
+    while pos < records.len() {
+        let (storage_ref, storage_root) =
+            decode_subtree_records(records, &mut pos, &Nibbles::default(), None)
+                .map_err(TrieError::from)?;
+        if let Some(hashed_addresses) = storage_by_root.get(&storage_root) {
+            for hashed_address in hashed_addresses {
+                storage_tries.insert(
+                    *hashed_address,
+                    Trie::new_temp_with_root(storage_ref.clone()),
+                );
+            }
+        }
+        // Subtries bound to no account are unused witness data; the spec
+        // tolerates them, so they are skipped rather than rejected.
+    }
+    Ok((state_trie, storage_tries))
 }
 
 /// RLP-decode the raw header byte slices into a `Vec<BlockHeader>`.
@@ -401,27 +423,6 @@ pub fn decode_witness_headers<B: AsRef<[u8]>>(
         .iter()
         .map(|b| BlockHeader::decode(b.as_ref()).map_err(GuestProgramStateError::from))
         .collect()
-}
-
-/// Locate the parent block's state root from a slice of decoded headers.
-/// Returns an error if `first_block_number == 0` (no parent possible) or if the
-/// parent header is not in the slice.
-fn find_parent_state_root(
-    headers: &[BlockHeader],
-    first_block_number: u64,
-) -> Result<H256, GuestProgramStateError> {
-    let parent_number = first_block_number
-        .checked_sub(1)
-        .ok_or(GuestProgramStateError::Custom(
-            "first_block_number must be > 0 (need parent header)".to_string(),
-        ))?;
-    headers
-        .iter()
-        .find(|h| h.number == parent_number)
-        .map(|h| h.state_root)
-        .ok_or_else(|| {
-            GuestProgramStateError::Custom(format!("header for block {parent_number} not found"))
-        })
 }
 
 /// Check that `headers[1..]` link via `parent_hash == keccak(RLP(prev))` AND
@@ -443,77 +444,6 @@ pub fn validate_witness_headers_chain(
         }
     }
     Ok(())
-}
-
-/// Recursively walks an embedded state trie node and collects
-/// `(hashed_address, storage_root)` pairs from leaf nodes.
-fn collect_accounts_from_trie(
-    node: &Node,
-    path: Nibbles,
-    accounts: &mut Vec<(H256, H256)>,
-    nodes: &FxHashMap<H256, Node>,
-    crypto: &dyn Crypto,
-) {
-    match node {
-        Node::Branch(branch) => {
-            for (i, child) in branch.choices.iter().enumerate() {
-                let child_node: Option<&Node> = match child {
-                    NodeRef::Node(n, _) => Some(n),
-                    NodeRef::Hash(hash) if hash.is_valid() => nodes.get(&hash.finalize(crypto)),
-                    _ => None,
-                };
-                if let Some(child_node) = child_node {
-                    collect_accounts_from_trie(
-                        child_node,
-                        path.append_new(i as u8),
-                        accounts,
-                        nodes,
-                        crypto,
-                    );
-                }
-            }
-        }
-        Node::Extension(ext) => {
-            let child_node: Option<&Node> = match &ext.child {
-                NodeRef::Node(n, _) => Some(n),
-                NodeRef::Hash(hash) if hash.is_valid() => nodes.get(&hash.finalize(crypto)),
-                _ => None,
-            };
-            if let Some(child_node) = child_node {
-                collect_accounts_from_trie(
-                    child_node,
-                    path.concat(&ext.prefix),
-                    accounts,
-                    nodes,
-                    crypto,
-                );
-            }
-        }
-        Node::Leaf(leaf) => {
-            let full_path = path.concat(&leaf.partial);
-            let path_bytes = full_path.to_bytes();
-            if path_bytes.len() == 32 {
-                let hashed_address = H256::from_slice(&path_bytes);
-                match AccountState::decode(&leaf.value) {
-                    Ok(account_state) => {
-                        accounts.push((hashed_address, account_state.storage_root));
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            ?hashed_address,
-                            error = %e,
-                            "Skipping leaf with un-decodable account state"
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    path_len = path_bytes.len(),
-                    "Skipping leaf with unexpected path length (expected 32)"
-                );
-            }
-        }
-    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -571,21 +501,13 @@ impl GuestProgramState {
             GuestProgramStateError::MissingParentHeaderOf(value.first_block_number),
         )?;
 
-        // hash state trie nodes
-        let state_trie = if let Some(state_trie_root) = value.state_trie_root {
-            Trie::new_temp_with_root(state_trie_root.into())
-        } else {
-            Trie::new_temp()
-        };
-        state_trie.hash_no_commit(crypto);
-
-        let mut storage_tries = BTreeMap::new();
-        for (hashed_address, storage_trie_root) in value.storage_trie_roots {
-            // hash storage trie nodes
-            let storage_trie = Trie::new_temp_with_root(storage_trie_root.into());
-            storage_trie.hash_no_commit(crypto);
-            storage_tries.insert(hashed_address, storage_trie);
-        }
+        // Build the tries straight from the DFS record stream: no node map, no
+        // embedding pass — each record links to its children by stream
+        // position and every rebuilt node is hash-seeded, so no upfront
+        // `hash_no_commit` is needed either. The stream's root is anchored to
+        // the parent header's state root inside.
+        let (state_trie, storage_tries) =
+            build_tries_from_records(&value.state_nodes, parent_header.state_root)?;
 
         // hash codes
         // TODO: codes here probably needs to be Vec<Code>, rather than recomputing here. This requires rkyv implementation.
@@ -908,9 +830,15 @@ impl GuestProgramState {
             let storage_trie = match self.storage_tries.get(&hashed_address) {
                 None if storage_root == EMPTY_TRIE_HASH => return Ok(None),
                 Some(trie) if trie.hash_no_commit(crypto) == storage_root => trie,
-                _ => {
+                None => {
                     return Err(GuestProgramStateError::Custom(format!(
-                        "invalid storage trie for account {address}"
+                        "missing storage trie for account {address} (hashed {hashed_address:?}, root {storage_root:?})"
+                    )));
+                }
+                Some(trie) => {
+                    return Err(GuestProgramStateError::Custom(format!(
+                        "storage trie hash mismatch for account {address}: got {:?}, want {storage_root:?}",
+                        trie.hash_no_commit(crypto)
                     )));
                 }
             };

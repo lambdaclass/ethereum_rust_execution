@@ -21,6 +21,8 @@ pub enum TrieError {
     DbError(anyhow::Error),
     #[error("Invalid trie input")]
     InvalidInput,
+    #[error("Witness node codec error: {0}")]
+    WitnessNode(#[from] crate::witness_codec::WitnessNodeError),
 }
 
 #[derive(Debug, Error)]
