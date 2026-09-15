@@ -113,6 +113,32 @@ pub fn sync_head_executed(store: &Store, sync_head: H256) -> Result<bool, SyncEr
     }
 }
 
+/// The forkchoice head's block number when it is canonical for us and at or below our own
+/// head, meaning there is nothing left to sync; `None` otherwise.
+///
+/// A consensus client that has fallen behind its own chain keeps pointing at such a head:
+/// post-ePBS it will not import a payload envelope optimistically while we answer SYNCING, so
+/// its head stops advancing while ours does not.
+///
+/// [`sync_head_executed`] does not cover this. The state trie is a single-version path store,
+/// so only the newest committed root is on disk and `has_state_root` is false for every
+/// canonical block below our head, however recently it was executed. Without this check the
+/// walk in [`sync_cycle_full`] starts from a head that is behind us and descends looking for a
+/// stateful parent it can never find, reaches genesis, and reports the state unrecoverable —
+/// escalating to a snap sync with nothing to do and leaving the node answering SYNCING forever.
+///
+/// Canonicality is what makes skipping the cycle safe: a reorg target is not canonical for us,
+/// so it does not take this path and still syncs normally.
+pub fn sync_head_not_ahead(store: &Store, sync_head: H256) -> Result<Option<u64>, SyncError> {
+    let Some(header) = store.get_block_header_by_hash(sync_head)? else {
+        return Ok(None);
+    };
+    if header.number <= store.get_latest_block_number()? && store.is_canonical_sync(sync_head)? {
+        return Ok(Some(header.number));
+    }
+    Ok(None)
+}
+
 /// Index of the first resume point in a single newest->oldest header batch, or `None` if the
 /// batch contains none. The headers before that index are the missing blocks to execute; the
 /// header at that index is our executed/state head. State is retained only for a recent window
@@ -185,6 +211,30 @@ pub async fn sync_cycle_full(
         info!(
             ?fcu_head_hash,
             "Sync head already executed locally; nothing to sync"
+        );
+        return Ok(());
+    }
+
+    // The forkchoice head can also be a block we already have on our canonical chain, at or
+    // below our own head. A consensus client that has fallen behind its own chain keeps
+    // pointing at such a head: post-ePBS it will not import a payload envelope optimistically
+    // while we answer SYNCING, so its head stops advancing while ours does not.
+    //
+    // `sync_head_executed` above does not catch this. The state trie is a single-version path
+    // store, so only the newest committed root is on disk: `has_state_root` is false for every
+    // canonical block below our head, however recently it was executed. The walk below would
+    // then start from a head that is *behind* us and descend looking for a stateful parent it
+    // can never find, reach genesis, and report the state unrecoverable — which escalates to a
+    // snap sync that has nothing to do, and leaves the node stuck answering SYNCING forever.
+    //
+    // Canonicality is what makes this safe: a reorg target is not canonical for us, so it does
+    // not take this path and still syncs normally.
+    if let Some(sync_head_number) = sync_head_not_ahead(&store, fcu_head_hash)? {
+        info!(
+            ?fcu_head_hash,
+            sync_head_number,
+            local_head,
+            "Sync head is canonical at or below our head; nothing to sync"
         );
         return Ok(());
     }
@@ -812,4 +862,91 @@ async fn run_blocks_pipeline(
     })
     .await
     .map_err(|e| (ChainError::Custom(e.to_string()), None))?
+}
+
+#[cfg(test)]
+mod sync_head_not_ahead_tests {
+    use super::*;
+    use ethrex_storage::EngineType;
+
+    /// Canonical headers `0..=head`, with `head` as the canonical head. Bodies and state are
+    /// irrelevant here: the predicate reads only the header, the canonical mapping and the
+    /// latest block number.
+    async fn store_with_canonical_chain(head: u64) -> (Store, Vec<BlockHeader>) {
+        let store = Store::new("", EngineType::InMemory).expect("in-memory store");
+        let headers: Vec<BlockHeader> = (0..=head)
+            .map(|number| BlockHeader {
+                number,
+                ..Default::default()
+            })
+            .collect();
+        store.add_block_headers(headers.clone()).await.unwrap();
+        let canonical: Vec<_> = headers.iter().map(|h| (h.number, h.hash())).collect();
+        store
+            .forkchoice_update(canonical, head, headers[head as usize].hash(), None, None)
+            .await
+            .unwrap();
+        (store, headers)
+    }
+
+    /// The case that deadlocked a node: the consensus client stopped advancing and keeps
+    /// pointing at a canonical block below our head. Without this the cycle walks to genesis
+    /// and reports the state unrecoverable.
+    #[tokio::test]
+    async fn reports_a_canonical_head_below_ours() {
+        let (store, headers) = store_with_canonical_chain(20).await;
+        let behind = headers[12].hash();
+        assert_eq!(sync_head_not_ahead(&store, behind).unwrap(), Some(12));
+    }
+
+    /// Equal heads are also nothing to sync: we already have that block canonically.
+    #[tokio::test]
+    async fn reports_a_canonical_head_equal_to_ours() {
+        let (store, headers) = store_with_canonical_chain(20).await;
+        let same = headers[20].hash();
+        assert_eq!(sync_head_not_ahead(&store, same).unwrap(), Some(20));
+    }
+
+    /// A head we have a header for but which is not on our canonical chain is a reorg target:
+    /// it must still sync, however low its number.
+    #[tokio::test]
+    async fn ignores_a_known_but_non_canonical_head() {
+        let (store, headers) = store_with_canonical_chain(20).await;
+        let sibling = BlockHeader {
+            number: 12,
+            gas_limit: 1234, // diverge from the canonical header at the same height
+            ..Default::default()
+        };
+        store
+            .add_block_header(sibling.hash(), sibling.clone())
+            .await
+            .unwrap();
+        assert_ne!(sibling.hash(), headers[12].hash());
+        assert_eq!(sync_head_not_ahead(&store, sibling.hash()).unwrap(), None);
+    }
+
+    /// The ordinary case: the consensus client is ahead, so the cycle must run.
+    #[tokio::test]
+    async fn ignores_a_head_above_ours() {
+        let (store, _) = store_with_canonical_chain(20).await;
+        let ahead = BlockHeader {
+            number: 25,
+            ..Default::default()
+        };
+        store
+            .add_block_header(ahead.hash(), ahead.clone())
+            .await
+            .unwrap();
+        assert_eq!(sync_head_not_ahead(&store, ahead.hash()).unwrap(), None);
+    }
+
+    /// A head we have never seen is the normal deep-sync case.
+    #[tokio::test]
+    async fn ignores_an_unknown_head() {
+        let (store, _) = store_with_canonical_chain(20).await;
+        assert_eq!(
+            sync_head_not_ahead(&store, H256::repeat_byte(0xab)).unwrap(),
+            None
+        );
+    }
 }
