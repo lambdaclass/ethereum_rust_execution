@@ -181,14 +181,25 @@ impl core::fmt::Debug for Encoder<'_> {
     }
 }
 
+/// Initial capacity of the payload scratch buffer.
+///
+/// Fields are staged in `temp_buf` so the list header can be written once the
+/// payload length is known. Starting that buffer empty makes every encode pay a
+/// chain of doubling reallocations — an RLP list of a few hundred bytes grows
+/// 8 → 16 → … → 512, so seven allocations and six copies for one node.
+///
+/// 512 covers a trie node (the hashing path already sizes its own buffers at
+/// 512 as the maximum encoded node size) and the common transaction and receipt
+/// shapes, which is where the encoder is hottest. Larger payloads still grow
+/// from here; the point is to skip the small doublings, not to bound the size.
+const ENCODER_SCRATCH_CAPACITY: usize = 512;
+
 impl<'a> Encoder<'a> {
     /// Creates a new encoder that writes to the given buffer.
     pub fn new(buf: &'a mut dyn BufMut) -> Self {
-        // PERF: we could pre-allocate the buffer or switch to `ArrayVec`` if we could
-        // bound the size of the encoded data.
         Self {
             buf,
-            temp_buf: Default::default(),
+            temp_buf: Vec::with_capacity(ENCODER_SCRATCH_CAPACITY),
         }
     }
 
