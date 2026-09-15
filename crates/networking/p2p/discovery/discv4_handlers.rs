@@ -1,4 +1,5 @@
 use crate::{
+    discovery::contact_table::{Contact, ContactValidation, DiscoveryProtocol},
     discovery::lookup::{IterativeLookup, LOOKUP_ALPHA, LOOKUP_BUCKET_SIZE},
     discv4::{
         messages::{
@@ -8,7 +9,6 @@ use crate::{
         server::{Discv4Message, EXPIRATION_SECONDS},
     },
     metrics::METRICS,
-    peer_table::{Contact, ContactValidation, DiscoveryProtocol, PeerTableServerProtocol as _},
     types::{Endpoint, Node},
     utils::{
         get_msg_expiration_from_seconds, is_msg_expired, node_id, public_key_from_signing_key,
@@ -114,11 +114,11 @@ impl DiscoveryServer {
 
     pub(crate) async fn discv4_revalidate(&mut self) -> Result<(), DiscoveryServerError> {
         if let Some(contact) = self
-            .peer_table
-            .get_contact_to_revalidate(REVALIDATION_INTERVAL, DiscoveryProtocol::Discv4)
-            .await?
+            .contacts
+            .contact_to_revalidate(REVALIDATION_INTERVAL, DiscoveryProtocol::Discv4)
         {
-            self.discv4_send_ping(&contact.node).await?;
+            let node = contact.node.clone();
+            self.discv4_send_ping(&node).await?;
         }
         Ok(())
     }
@@ -156,9 +156,8 @@ impl DiscoveryServer {
 
         // Seed with closest known nodes from the connection pool
         let seed = self
-            .peer_table
-            .get_closest_from_pool(target_id, LOOKUP_BUCKET_SIZE)
-            .await?;
+            .contacts
+            .closest_from_pool(target_id, LOOKUP_BUCKET_SIZE);
         if seed.is_empty() {
             trace!(
                 protocol = "discv4",
@@ -216,7 +215,7 @@ impl DiscoveryServer {
         for (idx, node_id, node, message) in queries {
             if let Err(e) = self.udp_socket.send_to(&message, &node.udp_addr()).await {
                 debug!(protocol = "discv4", sending = "FindNode", addr = ?node.udp_addr(), err=?e, "Error sending message");
-                self.peer_table.set_disposable(node_id)?;
+                self.contacts.set_disposable(&node_id);
                 METRICS.record_new_discarded_node();
                 if let Some(discv4) = &mut self.discv4
                     && let Some((lookup, _)) = discv4.active_lookups.get_mut(idx)
@@ -240,8 +239,9 @@ impl DiscoveryServer {
     }
 
     pub(crate) async fn discv4_enr_lookup(&mut self) -> Result<(), DiscoveryServerError> {
-        if let Some(contact) = self.peer_table.get_contact_for_enr_lookup().await? {
-            self.discv4_send_enr_request(&contact.node).await?;
+        if let Some(contact) = self.contacts.contact_for_enr_lookup() {
+            let node = contact.node.clone();
+            self.discv4_send_enr_request(&node).await?;
         }
         Ok(())
     }
@@ -267,12 +267,12 @@ impl DiscoveryServer {
         trace!(protocol = "discv4", sent = "Ping", to = %format!("{:#x}", node.public_key));
         METRICS.record_ping_sent().await;
         let ping_id = Bytes::copy_from_slice(ping_hash.as_bytes());
-        self.peer_table.record_ping_sent(node.node_id(), ping_id)?;
+        self.contacts.record_ping_sent(&node.node_id(), ping_id);
         Ok(())
     }
 
     async fn discv4_send_pong(
-        &self,
+        &mut self,
         ping_hash: H256,
         node: &Node,
     ) -> Result<(), DiscoveryServerError> {
@@ -290,7 +290,7 @@ impl DiscoveryServer {
     }
 
     async fn discv4_send_neighbors(
-        &self,
+        &mut self,
         neighbors: Vec<Node>,
         node: &Node,
     ) -> Result<(), DiscoveryServerError> {
@@ -305,13 +305,13 @@ impl DiscoveryServer {
         let expiration: u64 = get_msg_expiration_from_seconds(EXPIRATION_SECONDS);
         let enr_request = Message::ENRRequest(ENRRequestMessage { expiration });
         let enr_request_hash = self.discv4_send_else_dispose(enr_request, node).await?;
-        self.peer_table
-            .record_enr_request_sent(node.node_id(), enr_request_hash)?;
+        self.contacts
+            .record_enr_request_sent(node.node_id(), enr_request_hash);
         Ok(())
     }
 
     async fn discv4_send_enr_response(
-        &self,
+        &mut self,
         request_hash: H256,
         from: std::net::SocketAddr,
     ) -> Result<(), DiscoveryServerError> {
@@ -331,19 +331,17 @@ impl DiscoveryServer {
         self.discv4_send_pong(hash, &node).await?;
 
         if self
-            .peer_table
+            .contacts
             .insert_if_new(node.clone(), DiscoveryProtocol::Discv4)
             .await
-            .unwrap_or(false)
         {
             self.discv4_send_ping(&node).await?;
         } else {
             let node_id = node_id(&sender_public_key);
             let stored_enr_seq = self
-                .peer_table
-                .get_contact(node_id)
-                .await?
-                .and_then(|c| c.record)
+                .contacts
+                .get_contact(&node_id)
+                .and_then(|c| c.record.as_ref())
                 .map(|r| r.seq);
 
             let received_enr_seq = ping_message.enr_seq;
@@ -362,19 +360,24 @@ impl DiscoveryServer {
         message: PongMessage,
         node_id: H256,
     ) -> Result<(), DiscoveryServerError> {
-        let Some(contact) = self.peer_table.get_contact(node_id).await? else {
+        // Everything needed from the contact is copied out before the mutable
+        // borrows below: the table is plain state now, not an actor behind a
+        // channel, so a live `&Contact` would pin it for the rest of the call.
+        let Some((node, stored_enr_seq)) = self
+            .contacts
+            .get_contact(&node_id)
+            .map(|c| (c.node.clone(), c.record.as_ref().map(|r| r.seq)))
+        else {
             return Ok(());
         };
 
         let ping_id = Bytes::copy_from_slice(message.ping_hash.as_bytes());
-        self.peer_table.record_pong_received(node_id, ping_id)?;
-
-        let stored_enr_seq = contact.record.map(|r| r.seq);
+        self.contacts.record_pong_received(&node_id, &ping_id);
         let received_enr_seq = message.enr_seq;
         if let (Some(received), Some(stored)) = (received_enr_seq, stored_enr_seq)
             && received > stored
         {
-            self.discv4_send_enr_request(&contact.node).await?;
+            self.discv4_send_enr_request(&node).await?;
         }
 
         trace!(protocol = "discv4", observed_ip = %message.to.ip, "Recorded discv4 PONG IP vote");
@@ -397,7 +400,7 @@ impl DiscoveryServer {
             .await
         {
             let target_id = node_id(&target);
-            let neighbors = self.peer_table.get_closest_nodes(target_id).await?;
+            let neighbors = self.contacts.closest_nodes(target_id);
 
             for chunk in neighbors.chunks(8) {
                 let _ = self
@@ -434,8 +437,9 @@ impl DiscoveryServer {
         }
 
         let nodes = neighbors_message.nodes;
-        self.peer_table
-            .new_contacts(nodes.clone(), DiscoveryProtocol::Discv4)?;
+        self.contacts
+            .new_contacts(nodes.clone(), DiscoveryProtocol::Discv4)
+            .await;
 
         // Feed results into ALL active lookups (but don't advance — the timer
         // drives lookup progress so that traffic stays controlled).
@@ -473,7 +477,7 @@ impl DiscoveryServer {
             return Ok(());
         }
 
-        self.peer_table.mark_knows_us(node_id)?;
+        self.contacts.mark_knows_us(&node_id);
         Ok(())
     }
 
@@ -493,11 +497,11 @@ impl DiscoveryServer {
             return Ok(());
         }
 
-        self.peer_table.record_enr_response_received(
+        self.contacts.record_enr_response_received(
             node_id,
             enr_response_message.request_hash,
             enr_response_message.node_record.clone(),
-        )?;
+        );
 
         Ok(())
     }
@@ -509,7 +513,7 @@ impl DiscoveryServer {
         from: std::net::SocketAddr,
         message_type: &str,
     ) -> Result<Contact, DiscoveryServerError> {
-        match self.peer_table.validate_contact(node_id, from.ip()).await? {
+        match self.contacts.validate_contact(node_id, from.ip()) {
             ContactValidation::UnknownContact => {
                 debug!(protocol = "discv4", received = message_type, to = %format!("{sender_public_key:#x}"), "Unknown contact, skipping");
                 Err(DiscoveryServerError::InvalidContact)
@@ -543,7 +547,7 @@ impl DiscoveryServer {
     }
 
     async fn discv4_send(
-        &self,
+        &mut self,
         message: Message,
         addr: std::net::SocketAddr,
     ) -> Result<usize, DiscoveryServerError> {
@@ -576,7 +580,7 @@ impl DiscoveryServer {
             .expect("first 32 bytes are the message hash");
         if let Err(e) = self.udp_socket.send_to(&buf, node.udp_addr()).await {
             debug!(protocol = "discv4", sending = ?message, addr = ?node.udp_addr(), to = ?node.node_id(), err=?e, "Error sending message");
-            self.peer_table.set_disposable(node.node_id())?;
+            self.contacts.set_disposable(&node.node_id());
             METRICS.record_new_discarded_node();
             return Err(e.into());
         }

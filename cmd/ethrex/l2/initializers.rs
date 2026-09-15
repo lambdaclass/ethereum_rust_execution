@@ -300,11 +300,7 @@ pub async fn init_l2(
         if !opts.sequencer_opts.based {
             blockchain.set_synced();
         }
-        let peer_table = PeerTableServer::spawn(
-            local_p2p_node.node_id(),
-            opts.node_opts.target_peers,
-            store.clone(),
-        );
+        let peer_table = PeerTableServer::spawn(opts.node_opts.target_peers);
         let p2p_context = P2PContext::new(
             local_p2p_node.clone(),
             network_config,
@@ -336,7 +332,7 @@ pub async fn init_l2(
         )
         .expect("P2P context could not be created");
         let initiator = RLPxInitiator::spawn(p2p_context.clone());
-        let peer_handler = PeerHandler::new(peer_table, initiator);
+        let peer_handler = PeerHandler::new(peer_table, initiator, p2p_context.discovery.clone());
 
         // Create SyncManager
         let syncer = SyncManager::new(

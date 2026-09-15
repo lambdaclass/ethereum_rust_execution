@@ -1,5 +1,6 @@
 use crate::{
     discovery::{
+        contact_table::{ContactValidation, DiscoveryProtocol},
         ip_predictor::IpPredictor,
         lookup::{IterativeLookup, LOOKUP_ALPHA, LOOKUP_BUCKET_SIZE},
     },
@@ -15,10 +16,8 @@ use crate::{
         },
     },
     metrics::METRICS,
-    peer_table::{ContactValidation, DiscoveryProtocol, PeerTableServerProtocol as _},
-    rlpx::utils::compress_pubkey,
     types::{Node, NodeRecord},
-    utils::{distance, node_id},
+    utils::{compress_pubkey, distance, node_id},
 };
 use bytes::{Bytes, BytesMut};
 use ethrex_common::{H256, H512};
@@ -76,11 +75,7 @@ impl DiscoveryServer {
         // (an unauthenticated single-packet DoS of the discv5 actor).
         let src_id = Ordinary::src_id(&packet)?;
 
-        let decrypt_key = self
-            .peer_table
-            .get_session_info(src_id)
-            .await?
-            .map(|s| s.inbound_key);
+        let decrypt_key = self.contacts.session(&src_id).map(|s| s.inbound_key);
 
         let discv5 = self.discv5.as_mut().expect("discv5 state must exist");
 
@@ -119,6 +114,18 @@ impl DiscoveryServer {
                     .await;
             }
         };
+
+        // The packet decrypted and arrived from the address this session was established
+        // from, which is the only thing that keeps a session alive. Both halves are
+        // refreshed together: keys outliving their `session_ips` entry would silently lose
+        // the IP-rebinding check above. Placed after the match so a packet from a
+        // mismatched IP, or one that failed to decrypt, extends nothing.
+        self.contacts.touch_session(&src_id);
+        if let Some(discv5) = self.discv5.as_mut()
+            && let Some(source) = discv5.session_ips.get_mut(&src_id)
+        {
+            source.last_used = Instant::now();
+        }
 
         tracing::trace!(protocol = "discv5", received = %ordinary.message, from = %src_id, %addr);
 
@@ -172,7 +179,7 @@ impl DiscoveryServer {
             &node.node_id(),
         );
 
-        self.peer_table.set_session_info(node.node_id(), session)?;
+        self.contacts.set_session(node.node_id(), session);
 
         let whoareyou = WhoAreYou::decode(&packet)?;
         let record = (self.local_node_record.seq != whoareyou.enr_seq)
@@ -199,7 +206,7 @@ impl DiscoveryServer {
             DiscoveryServerError::CryptographyError("Invalid ephemeral pubkey".into())
         })?;
 
-        let src_pubkey = if let Some(contact) = self.peer_table.get_contact(src_id).await? {
+        let src_pubkey = if let Some(contact) = self.contacts.get_contact(&src_id) {
             compress_pubkey(contact.node.public_key)
         } else if let Some(record) = &authdata.record {
             if !record.verify_signature() {
@@ -246,7 +253,9 @@ impl DiscoveryServer {
         }
 
         if let Some(record) = &authdata.record {
-            self.peer_table.new_contact_records(vec![record.clone()])?;
+            self.contacts
+                .new_contact_records(vec![record.clone()])
+                .await;
         }
 
         let session = derive_session_keys(
@@ -258,13 +267,13 @@ impl DiscoveryServer {
             false,
         );
 
-        self.peer_table.set_session_info(src_id, session.clone())?;
+        self.contacts.set_session(src_id, session.clone());
         let discv5 = self.discv5.as_mut().expect("discv5 state must exist");
         discv5.session_ips.insert(
             src_id,
             SessionSource {
                 ip: addr.ip(),
-                established_at: std::time::Instant::now(),
+                last_used: std::time::Instant::now(),
             },
         );
 
@@ -280,12 +289,13 @@ impl DiscoveryServer {
 
     pub(crate) async fn discv5_revalidate(&mut self) -> Result<(), DiscoveryServerError> {
         if let Some(contact) = self
-            .peer_table
-            .get_contact_to_revalidate(REVALIDATION_INTERVAL, DiscoveryProtocol::Discv5)
-            .await?
-            && let Err(e) = self.discv5_send_ping(&contact.node).await
+            .contacts
+            .contact_to_revalidate(REVALIDATION_INTERVAL, DiscoveryProtocol::Discv5)
         {
-            trace!(protocol = "discv5", node = %contact.node.node_id(), err = ?e, "Failed to send revalidation PING");
+            let node = contact.node.clone();
+            if let Err(e) = self.discv5_send_ping(&node).await {
+                trace!(protocol = "discv5", node = %node.node_id(), err = ?e, "Failed to send revalidation PING");
+            }
         }
         Ok(())
     }
@@ -321,9 +331,8 @@ impl DiscoveryServer {
 
         // Seed with closest known nodes from the connection pool
         let seed = self
-            .peer_table
-            .get_closest_from_pool(target_id, LOOKUP_BUCKET_SIZE)
-            .await?;
+            .contacts
+            .closest_from_pool(target_id, LOOKUP_BUCKET_SIZE);
         if seed.is_empty() {
             trace!(
                 protocol = "discv5",
@@ -368,7 +377,7 @@ impl DiscoveryServer {
             let find_node_msg = self.discv5_build_find_node_for_target(target, &node);
             if let Err(e) = self.discv5_send_ordinary(find_node_msg, &node).await {
                 debug!(protocol = "discv5", sending = "FindNode", addr = ?node.udp_addr(), err=?e, "Error sending message");
-                self.peer_table.set_disposable(node_id)?;
+                self.contacts.set_disposable(&node_id);
                 METRICS.record_new_discarded_node();
                 if let Some(discv5) = &mut self.discv5
                     && let Some(lookup) = discv5.active_lookups.get_mut(idx)
@@ -414,9 +423,12 @@ impl DiscoveryServer {
         });
 
         if outbound_key.is_none()
-            && let Some(contact) = self.peer_table.get_contact(sender_id).await?
+            && let Some(node) = self
+                .contacts
+                .get_contact(&sender_id)
+                .map(|c| c.node.clone())
         {
-            return self.discv5_send_ordinary(pong, &contact.node).await;
+            return self.discv5_send_ordinary(pong, &node).await;
         }
         let key = self
             .discv5_resolve_outbound_key(&sender_id, outbound_key)
@@ -432,25 +444,29 @@ impl DiscoveryServer {
         pong_message: PongMessage,
         sender_id: H256,
     ) -> Result<(), DiscoveryServerError> {
-        self.peer_table
-            .record_pong_received(sender_id, pong_message.req_id)?;
+        self.contacts
+            .record_pong_received(&sender_id, &pong_message.req_id);
 
-        if let Some(contact) = self.peer_table.get_contact(sender_id).await? {
-            let cached_seq = contact.record.as_ref().map_or(0, |r| r.seq);
-            if pong_message.enr_seq > cached_seq {
-                trace!(
-                    protocol = "discv5",
-                    from = %sender_id,
-                    cached_seq,
-                    pong_seq = pong_message.enr_seq,
-                    "ENR seq mismatch, requesting updated ENR (FINDNODE distance 0)"
-                );
-                let find_node = Message::FindNode(FindNodeMessage {
-                    req_id: generate_req_id(),
-                    distances: vec![0],
-                });
-                self.discv5_send_ordinary(find_node, &contact.node).await?;
-            }
+        // Copied out rather than held: the table is plain state, so a live
+        // `&Contact` would block the `&mut self` send below.
+        if let Some((node, cached_seq)) = self
+            .contacts
+            .get_contact(&sender_id)
+            .map(|c| (c.node.clone(), c.record.as_ref().map_or(0, |r| r.seq)))
+            && pong_message.enr_seq > cached_seq
+        {
+            trace!(
+                protocol = "discv5",
+                from = %sender_id,
+                cached_seq,
+                pong_seq = pong_message.enr_seq,
+                "ENR seq mismatch, requesting updated ENR (FINDNODE distance 0)"
+            );
+            let find_node = Message::FindNode(FindNodeMessage {
+                req_id: generate_req_id(),
+                distances: vec![0],
+            });
+            self.discv5_send_ordinary(find_node, &node).await?;
         }
 
         if let Some(ip) = self
@@ -470,11 +486,7 @@ impl DiscoveryServer {
         sender_addr: SocketAddr,
         outbound_key: Option<[u8; 16]>,
     ) -> Result<(), DiscoveryServerError> {
-        let send_to_contact = match self
-            .peer_table
-            .validate_contact(sender_id, sender_addr.ip())
-            .await?
-        {
+        let send_to_contact = match self.contacts.validate_contact(sender_id, sender_addr.ip()) {
             ContactValidation::Valid(contact) => Some(*contact),
             ContactValidation::UnknownContact => None,
             reason => {
@@ -484,9 +496,8 @@ impl DiscoveryServer {
         };
 
         let mut nodes = self
-            .peer_table
-            .get_nodes_at_distances(find_node_message.distances.clone())
-            .await?;
+            .contacts
+            .nodes_at_distances(&find_node_message.distances);
         if find_node_message.distances.contains(&0) {
             nodes.push(self.local_node_record.clone());
         }
@@ -536,7 +547,7 @@ impl DiscoveryServer {
     ) -> Result<(), DiscoveryServerError> {
         // Only accept a NODES that answers a FINDNODE we actually sent to this
         // peer. Without the check, any peer that has completed a handshake can
-        // push ENRs of its choosing into our peer table with an unsolicited
+        // push ENRs of its choosing into our contact table with an unsolicited
         // NODES, and we then hand them back out in our own FINDNODE responses.
         let solicited = self.discv5.as_ref().is_some_and(|discv5| {
             discv5
@@ -552,8 +563,9 @@ impl DiscoveryServer {
             return Ok(());
         }
 
-        self.peer_table
-            .new_contact_records(nodes_message.nodes.clone())?;
+        self.contacts
+            .new_contact_records(nodes_message.nodes.clone())
+            .await;
 
         // Feed results into ALL active lookups (but don't advance — the timer
         // drives lookup progress so that traffic stays controlled).
@@ -583,7 +595,7 @@ impl DiscoveryServer {
         });
 
         self.discv5_send_ordinary(ping, node).await?;
-        self.peer_table.record_ping_sent(node.node_id(), req_id)?;
+        self.contacts.record_ping_sent(&node.node_id(), req_id);
 
         Ok(())
     }
@@ -602,7 +614,7 @@ impl DiscoveryServer {
             src_id: self.local_node.node_id(),
             message: message.clone(),
         };
-        let encrypt_key = match self.peer_table.get_session_info(node.node_id()).await? {
+        let encrypt_key = match self.contacts.session(&node.node_id()) {
             Some(s) => s.outbound_key,
             None => {
                 trace!(
@@ -638,14 +650,14 @@ impl DiscoveryServer {
     }
 
     async fn discv5_resolve_outbound_key(
-        &self,
+        &mut self,
         node_id: &H256,
         key: Option<[u8; 16]>,
     ) -> Result<[u8; 16], DiscoveryServerError> {
         if let Some(key) = key {
             return Ok(key);
         }
-        match self.peer_table.get_session_info(*node_id).await? {
+        match self.contacts.session(node_id) {
             Some(s) => Ok(s.outbound_key),
             None => {
                 trace!(
@@ -713,7 +725,7 @@ impl DiscoveryServer {
             record,
             message: message.clone(),
         };
-        let encrypt_key = match self.peer_table.get_session_info(node.node_id()).await? {
+        let encrypt_key = match self.contacts.session(&node.node_id()) {
             Some(s) => s.outbound_key,
             None => {
                 trace!(
@@ -813,9 +825,8 @@ impl DiscoveryServer {
         let mut rng = OsRng;
 
         let enr_seq = self
-            .peer_table
-            .get_contact(src_id)
-            .await?
+            .contacts
+            .get_contact(&src_id)
             .map_or(0, |c| c.record.as_ref().map_or(0, |r| r.seq));
 
         let who_are_you = WhoAreYou {
@@ -847,7 +858,7 @@ impl DiscoveryServer {
     }
 
     async fn discv5_send_packet(
-        &self,
+        &mut self,
         packet: &Packet,
         dest_id: &H256,
         addr: SocketAddr,
@@ -928,4 +939,137 @@ impl DiscoveryServer {
 fn generate_req_id() -> Bytes {
     let mut rng = OsRng;
     Bytes::from(rng.r#gen::<u64>().to_be_bytes().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discv5::server::SESSION_TTL;
+    use crate::discv5::session::Session;
+    use crate::peer_filter::AcceptAllFilter;
+    use std::net::IpAddr;
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+
+    /// The peer's outbound key, which is our inbound key: what a packet from it is
+    /// encrypted with and what the handler must look up to decrypt one.
+    const PEER_KEY: [u8; 16] = [7; 16];
+    const SESSION_IP: &str = "127.0.0.1";
+
+    async fn server_with_session(session_ip: IpAddr) -> (DiscoveryServer, H256) {
+        let local_node = Node::from_enode_url(
+            "enode://d860a01f9722d78051619d1e2351aba3f43f943f6f00718d1b9baa4101932a1f5011f16bb2b1bb35db20d6fe28fa0bf09636d26a87d31de9ec6203eeedb1f666@18.138.108.67:30303",
+        ).expect("Bad enode url");
+        let signer = SecretKey::new(&mut OsRng);
+        let local_node_record = NodeRecord::from_node(&local_node, 1, &signer).unwrap();
+        let mut server = DiscoveryServer::new_for_discv5_test(
+            local_node,
+            local_node_record,
+            signer,
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            Box::new(AcceptAllFilter),
+        );
+
+        let peer_id = H256::repeat_byte(0xab);
+        server.contacts_mut().set_session(
+            peer_id,
+            Session {
+                outbound_key: [8; 16],
+                inbound_key: PEER_KEY,
+            },
+        );
+        server
+            .discv5
+            .as_mut()
+            .expect("discv5 state must exist")
+            .session_ips
+            .insert(
+                peer_id,
+                SessionSource {
+                    ip: session_ip,
+                    last_used: Instant::now(),
+                },
+            );
+        (server, peer_id)
+    }
+
+    /// An unsolicited NODES message: it reaches the refresh, then `discv5_handle_message`
+    /// drops it for having no matching request, so the packet has no other effect.
+    fn packet_from(peer_id: H256) -> Packet {
+        Ordinary {
+            src_id: peer_id,
+            message: Message::Nodes(NodesMessage {
+                req_id: Bytes::from_static(&[1, 2, 3]),
+                total: 1,
+                nodes: vec![],
+            }),
+        }
+        .encode(&[0; 12], [0; 16], &PEER_KEY)
+        .expect("failed to encode test packet")
+    }
+
+    fn age_session(server: &mut DiscoveryServer, by: Duration) {
+        server.contacts_mut().age_sessions_for_test(by);
+        for source in server
+            .discv5
+            .as_mut()
+            .expect("discv5 state must exist")
+            .session_ips
+            .values_mut()
+        {
+            source.last_used -= by;
+        }
+    }
+
+    /// Runs both halves' sweeps and reports which survived, as `(keys, session_ips)`.
+    fn survives_sweeps(server: &mut DiscoveryServer, peer_id: &H256) -> (bool, bool) {
+        server.contacts_mut().prune();
+        let keys = server.contacts_mut().session(peer_id).is_some();
+        let discv5 = server.discv5.as_mut().expect("discv5 state must exist");
+        discv5.cleanup_stale_entries();
+        (keys, discv5.session_ips.contains_key(peer_id))
+    }
+
+    #[tokio::test]
+    async fn a_packet_that_decrypts_refreshes_both_halves_of_the_session() {
+        // The halves must move together. Keys that outlive their `session_ips` entry
+        // silently lose the IP-rebinding check, since a missing entry reads as nothing
+        // to compare against.
+        let (mut server, peer_id) = server_with_session(SESSION_IP.parse().unwrap()).await;
+        age_session(&mut server, SESSION_TTL);
+
+        server
+            .discv5_handle_ordinary(
+                packet_from(peer_id),
+                format!("{SESSION_IP}:30304").parse().unwrap(),
+            )
+            .await
+            .expect("handling an unsolicited NODES packet should not fail");
+
+        assert_eq!(
+            survives_sweeps(&mut server, &peer_id),
+            (true, true),
+            "using a session must keep both its keys and its IP guard alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_packet_from_another_ip_refreshes_nothing() {
+        // The rebinding check answers this one with a WHOAREYOU. Refreshing here would
+        // let whoever can reach us from another address hold a session open forever.
+        let (mut server, peer_id) = server_with_session(SESSION_IP.parse().unwrap()).await;
+        age_session(&mut server, SESSION_TTL);
+
+        // The WHOAREYOU reply goes out over a real socket to a port with no listener;
+        // whether that send reports an error is irrelevant to what is asserted here.
+        let _ = server
+            .discv5_handle_ordinary(packet_from(peer_id), "127.0.0.2:30304".parse().unwrap())
+            .await;
+
+        assert_eq!(
+            survives_sweeps(&mut server, &peer_id),
+            (false, false),
+            "an aged session used from the wrong address is still reaped"
+        );
+    }
 }

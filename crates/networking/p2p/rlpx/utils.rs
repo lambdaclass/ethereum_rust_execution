@@ -1,4 +1,4 @@
-use ethrex_common::H512;
+pub use crate::utils::{compress_pubkey, decompress_pubkey};
 use ethrex_rlp::error::{RLPDecodeError, RLPEncodeError};
 use secp256k1::ecdh::shared_secret_point;
 use secp256k1::{PublicKey, SecretKey};
@@ -44,22 +44,6 @@ pub fn kdf(secret: &[u8], output: &mut [u8]) -> Result<(), CryptographyError> {
     // We don't use the `other_info` field
     concat_kdf::derive_key_into::<sha2::Sha256>(secret, &[], output)
         .map_err(|error| CryptographyError::CouldNotGetKeyFromSecret(error.to_string()))
-}
-
-/// Decompresses the received public key
-pub fn decompress_pubkey(pk: &PublicKey) -> H512 {
-    let bytes = pk.serialize_uncompressed();
-    debug_assert_eq!(bytes[0], 4);
-    H512::from_slice(&bytes[1..])
-}
-
-/// Compresses the received public key
-/// The received value is the uncompressed public key of a node, with the first byte omitted (0x04).
-pub fn compress_pubkey(pk: H512) -> Option<PublicKey> {
-    let mut full_pk = [0u8; 65];
-    full_pk[0] = 0x04;
-    full_pk[1..].copy_from_slice(&pk.0);
-    PublicKey::from_slice(&full_pk).ok()
 }
 
 pub fn snappy_compress(encoded_data: Vec<u8>) -> Result<Vec<u8>, RLPEncodeError> {

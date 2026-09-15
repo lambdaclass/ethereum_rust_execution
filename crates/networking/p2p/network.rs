@@ -4,8 +4,9 @@ use crate::rlpx::l2::l2_connection::P2PBasedContext;
 #[derive(Clone, Debug)]
 pub struct P2PBasedContext;
 use crate::{
-    discovery::{DiscoveryConfig, DiscoveryServer, DiscoveryServerError},
+    discovery::{DiscoveryConfig, DiscoveryHandle, DiscoveryServer, DiscoveryServerError},
     metrics::{CurrentStepValue, METRICS},
+    peer_filter::EthForkIdFilter,
     peer_table::{PeerData, PeerTable, PeerTableServerProtocol as _},
     rlpx::{
         connection::server::{PeerConnBroadcastSender, PeerConnection},
@@ -39,6 +40,9 @@ pub struct P2PContext {
     pub tracker: TaskTracker,
     pub signer: SecretKey,
     pub table: PeerTable,
+    /// Reaches the discovery server, once one is running. Inert when p2p runs
+    /// without discovery.
+    pub discovery: DiscoveryHandle,
     pub storage: Store,
     pub blockchain: Arc<Blockchain>,
     pub(crate) broadcast: PeerConnBroadcastSender,
@@ -100,6 +104,7 @@ impl P2PContext {
             tracker,
             signer,
             table: peer_table,
+            discovery: DiscoveryHandle::new(),
             storage,
             blockchain,
             broadcast: channel_broadcast_send_end,
@@ -172,12 +177,12 @@ pub async fn start_network(
     // decides what the node announces, discovery only republishes.
     let fork_id_rx = spawn_fork_id_publisher(&context, initial_fork_id);
 
-    DiscoveryServer::spawn(
+    let discovery = DiscoveryServer::spawn(
         context.local_node.clone(),
         local_node_record,
         context.signer,
         udp_socket,
-        context.table.clone(),
+        Box::new(EthForkIdFilter::new(context.storage.clone())),
         bootnodes,
         config,
         shared_local_node,
@@ -187,6 +192,12 @@ pub async fn start_network(
     .inspect_err(|e| {
         error!("Failed to start discovery server: {e}");
     })?;
+
+    // Publishes the server to every clone of the context, which is what lets the
+    // initiator ask for dial candidates and connections report their lifecycle.
+    if !context.discovery.set(discovery) {
+        error!("Discovery server was already set on this context");
+    }
 
     context.tracker.spawn(serve_p2p_requests(context.clone()));
 

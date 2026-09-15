@@ -20,20 +20,35 @@ use tracing::trace;
 pub const MAX_WHOAREYOU_RATE_LIMIT_ENTRIES: usize = 10_000;
 /// Timeout for pending messages awaiting WhoAreYou response.
 const MESSAGE_CACHE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Max age of a `session_ips` entry before it is evicted. Bounds the map: it is inserted
-/// per discv5 handshake and (absent this) was never removed for nodes we don't keep as peers.
-const SESSION_TTL: Duration = Duration::from_secs(3600);
+/// Max time a discv5 session may sit unused before it is evicted. Bounds both halves of
+/// a session: the symmetric keys in the contact table and the `session_ips` entry that
+/// guards them. Both are inserted per handshake, by a remote peer's schedule, so without
+/// this neither is ever removed for a node we do not keep as a peer.
+///
+/// Idle rather than absolute, so a peer we are still talking to is never made to
+/// re-handshake mid-conversation: that costs a WHOAREYOU round trip and drops the message
+/// that triggered it if the exchange outruns `MESSAGE_CACHE_TIMEOUT`. The
+/// handshake-once-and-vanish population this exists to bound is unaffected, since nothing
+/// refreshes those.
+///
+/// Shared rather than duplicated: when the keys outlive their `session_ips` entry, the
+/// IP-rebinding check in `discv5_handle_ordinary` silently stops applying to a session
+/// that still decrypts. Both halves are refreshed together, for that same reason.
+pub const SESSION_TTL: Duration = Duration::from_secs(3600);
 /// How long an outstanding FINDNODE stays eligible to be answered. Generous
 /// enough for a multi-packet NODES response over a slow link, short enough that
 /// a request id cannot be replayed against us much later.
 const PENDING_FINDNODE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Source IP a discv5 session was established from, paired with when it was recorded so stale
-/// entries can be evicted (see `SESSION_TTL`).
+/// Source IP a discv5 session was established from, paired with when the session was last
+/// used so idle entries can be evicted (see `SESSION_TTL`).
+///
+/// The IP itself is never refreshed, only the timestamp: rebinding is still detected for
+/// the whole life of the session.
 #[derive(Debug, Clone)]
 pub struct SessionSource {
     pub ip: IpAddr,
-    pub established_at: Instant,
+    pub last_used: Instant,
 }
 
 /// Discv5-specific state held within the unified DiscoveryServer.
@@ -52,8 +67,8 @@ pub struct Discv5State {
     pub whoareyou_global_count: u32,
     /// Start of the current global rate limit window.
     pub whoareyou_global_window_start: Instant,
-    /// Tracks the source IP that each session was established from, with the insertion time
-    /// so stale entries can be evicted (see `SESSION_TTL`).
+    /// Tracks the source IP that each session was established from, with the time the
+    /// session was last used so idle entries can be evicted (see `SESSION_TTL`).
     pub session_ips: FxHashMap<H256, SessionSource>,
     /// Currently active iterative lookups.
     pub active_lookups: Vec<IterativeLookup>,
@@ -124,7 +139,7 @@ impl Discv5State {
 
         let before_sessions = self.session_ips.len();
         self.session_ips
-            .retain(|_node_id, source| now.duration_since(source.established_at) < SESSION_TTL);
+            .retain(|_node_id, source| now.duration_since(source.last_used) < SESSION_TTL);
         let removed_sessions = before_sessions - self.session_ips.len();
 
         let total_removed = removed_messages + removed_challenges + removed_sessions;

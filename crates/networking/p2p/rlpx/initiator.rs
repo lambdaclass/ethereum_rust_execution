@@ -107,8 +107,8 @@ impl RLPxInitiator {
 
     async fn do_look_for_peer(&mut self) -> Result<(), RLPxInitiatorError> {
         if !self.context.table.target_peers_reached().await? {
-            if let Some(contact) = self.context.table.get_contact_to_initiate().await? {
-                PeerConnection::spawn_as_initiator(self.context.clone(), &contact.node);
+            if let Some(node) = self.context.discovery.next_dial_candidate().await {
+                PeerConnection::spawn_as_initiator(self.context.clone(), &node);
                 METRICS.record_new_rlpx_conn_attempt().await;
             };
         } else {

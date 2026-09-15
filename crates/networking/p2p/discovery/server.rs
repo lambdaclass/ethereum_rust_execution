@@ -8,10 +8,11 @@ use crate::{
         messages::{Packet as Discv5Packet, PacketCodecError},
         server::{Discv5Message, Discv5State, update_local_ip},
     },
-    peer_table::{DiscoveryProtocol, PeerTable, PeerTableServerProtocol as _},
+    peer_filter::PeerFilter,
     types::{Node, NodeRecord, SharedLocalNode},
 };
 use bytes::BytesMut;
+use ethrex_common::H256;
 use ethrex_common::types::ForkId;
 use ethrex_common::utils::keccak;
 use futures::StreamExt;
@@ -21,8 +22,8 @@ use spawned_concurrency::{
     error::ActorError,
     protocol,
     tasks::{
-        Actor, ActorStart as _, Context, Handler, send_after, send_interval, send_message_on,
-        spawn_listener,
+        Actor, ActorRef, ActorStart as _, Context, Handler, Response, send_after, send_interval,
+        send_message_on, spawn_listener,
     },
 };
 use std::{
@@ -36,7 +37,11 @@ use tokio::sync::watch;
 use tokio_util::udp::UdpFramed;
 use tracing::{debug, error, info, trace, warn};
 
-use super::{DiscoveryConfig, codec::DiscriminatingCodec, lookup_interval_function};
+use super::{
+    DiscoveryConfig, codec::DiscriminatingCodec, contact_table::ContactTable,
+    contact_table::DiscoveryProtocol, contact_table::PeerEvent, lookup_interval_function,
+};
+use std::sync::OnceLock;
 
 /// Minimum packet size for a valid discv4 packet.
 /// hash (32) + signature (65) + type (1) = 98 bytes
@@ -65,9 +70,7 @@ pub enum DiscoveryServerError {
     #[error("Unknown or invalid contact")]
     InvalidContact,
     #[error(transparent)]
-    PeerTable(#[from] ActorError),
-    #[error(transparent)]
-    Store(#[from] ethrex_storage::error::StoreError),
+    Actor(#[from] ActorError),
     #[error("Internal error {0}")]
     InternalError(String),
     #[error("Cryptography Error {0}")]
@@ -79,6 +82,9 @@ pub enum DiscoveryServerError {
 #[protocol]
 pub trait DiscoveryServerProtocol: Send + Sync {
     fn raw_packet(&self, data: BytesMut, from: SocketAddr) -> Result<(), ActorError>;
+    /// Report something that happened to the consumer's relationship with a
+    /// peer. See [`PeerEvent`] for what each variant does.
+    fn record_peer_event(&self, node_id: H256, event: PeerEvent) -> Result<(), ActorError>;
     fn revalidate_v4(&self) -> Result<(), ActorError>;
     fn revalidate_v5(&self) -> Result<(), ActorError>;
     fn lookup_v4(&self) -> Result<(), ActorError>;
@@ -86,6 +92,70 @@ pub trait DiscoveryServerProtocol: Send + Sync {
     fn enr_lookup(&self) -> Result<(), ActorError>;
     fn prune(&self) -> Result<(), ActorError>;
     fn shutdown(&self) -> Result<(), ActorError>;
+
+    /// The next node worth dialing, or `None` when nothing in the pool is
+    /// eligible right now.
+    fn next_dial_candidate(&self) -> Response<Option<Node>>;
+}
+
+/// The consumer's handle on a discovery server.
+///
+/// Discovery is started after the context that reaches it, and is not started
+/// at all when p2p is disabled, so the handle is filled in once the server is
+/// up and is inert until then.
+///
+/// Every message across this boundary but one is a cast. Discovery never calls
+/// back into its consumer, which is what keeps two actors with sequential
+/// mailboxes from deadlocking on each other.
+#[derive(Clone, Debug, Default)]
+pub struct DiscoveryHandle(Arc<OnceLock<ActorRef<DiscoveryServer>>>);
+
+impl DiscoveryHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish the running server to every clone of this handle. A second call
+    /// is ignored, and reported as `false`.
+    pub fn set(&self, server: ActorRef<DiscoveryServer>) -> bool {
+        self.0.set(server).is_ok()
+    }
+
+    /// Casts are dropped on the floor while discovery is down: there is no
+    /// contact table to record them in, and no later moment at which replaying
+    /// them would mean anything.
+    fn server(&self) -> Option<&ActorRef<DiscoveryServer>> {
+        self.0.get()
+    }
+
+    /// Report something that happened to a peer. See [`PeerEvent`]: these are
+    /// events, not a state machine, and `Rejected` is only ever reported for an
+    /// attempt that never became a connection.
+    pub fn record_peer_event(&self, node_id: H256, event: PeerEvent) {
+        if let Some(server) = self.server() {
+            let _ = server.record_peer_event(node_id, event);
+        }
+    }
+
+    /// Ask discovery to drop the contacts it has written off, so replacements
+    /// waiting in the k-buckets get promoted.
+    pub fn prune(&self) {
+        if let Some(server) = self.server() {
+            let _ = server.prune();
+        }
+    }
+
+    /// The next node discovery thinks is worth dialing. `None` when discovery
+    /// is down, has nothing eligible, or the request failed.
+    pub async fn next_dial_candidate(&self) -> Option<Node> {
+        let server = self.server()?;
+        server
+            .next_dial_candidate()
+            .await
+            .inspect_err(|e| debug!(err=?e, "Failed to ask discovery for a dial candidate"))
+            .ok()
+            .flatten()
+    }
 }
 
 pub struct DiscoveryServer {
@@ -93,7 +163,9 @@ pub struct DiscoveryServer {
     pub local_node_record: NodeRecord,
     pub(crate) signer: SecretKey,
     pub(crate) udp_socket: Arc<UdpSocket>,
-    pub peer_table: PeerTable,
+    /// Everything known about nodes we have merely heard of. Plain state: the
+    /// handlers below all run inside this actor, so they reach it directly.
+    pub(crate) contacts: ContactTable,
     pub(crate) config: DiscoveryConfig,
     pub discv4: Option<Discv4State>,
     pub discv5: Option<Discv5State>,
@@ -117,6 +189,7 @@ impl std::fmt::Debug for DiscoveryServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiscoveryServer")
             .field("local_node", &self.local_node)
+            .field("contacts", &self.contacts)
             .field("discv4_enabled", &self.discv4.is_some())
             .field("discv5_enabled", &self.discv5.is_some())
             .field("ip_predictor", &self.ip_predictor)
@@ -127,8 +200,13 @@ impl std::fmt::Debug for DiscoveryServer {
 
 #[actor(protocol = DiscoveryServerProtocol)]
 impl DiscoveryServer {
-    /// Starts the discovery actor, advertising `local_node_record` as this
-    /// node's ENR.
+    ////// Starts the discovery actor, advertising `local_node_record` as this
+    /// node's ENR, and returns a handle on the running server.
+    ///
+    /// `filter` is what this consumer requires of a discovered peer: every ENR
+    /// discovery sees is judged by it. A contact discovered without an ENR is
+    /// never screened and stays dialable, so bootnodes are usable before they
+    /// have published anything.
     #[expect(
         clippy::too_many_arguments,
         reason = "caller-supplied values; bundling them would only hide the call site"
@@ -138,13 +216,15 @@ impl DiscoveryServer {
         local_node_record: NodeRecord,
         signer: SecretKey,
         udp_socket: Arc<UdpSocket>,
-        peer_table: PeerTable,
+        filter: Box<dyn PeerFilter>,
         bootnodes: Vec<Node>,
         config: DiscoveryConfig,
         shared_local_node: SharedLocalNode,
         fork_id: watch::Receiver<Option<ForkId>>,
-    ) -> Result<(), DiscoveryServerError> {
+    ) -> Result<ActorRef<DiscoveryServer>, DiscoveryServerError> {
         debug!("Starting discovery server");
+
+        let mut contacts = ContactTable::new(local_node.node_id(), config.target_peers, filter);
 
         let discv4 = if config.discv4_enabled {
             info!(
@@ -152,7 +232,9 @@ impl DiscoveryServer {
                 count = bootnodes.len(),
                 "Adding bootnodes"
             );
-            peer_table.new_contacts(bootnodes.clone(), DiscoveryProtocol::Discv4)?;
+            contacts
+                .new_contacts(bootnodes.clone(), DiscoveryProtocol::Discv4)
+                .await;
             Some(Discv4State::default())
         } else {
             None
@@ -164,7 +246,9 @@ impl DiscoveryServer {
                 count = bootnodes.len(),
                 "Adding bootnodes"
             );
-            peer_table.new_contacts(bootnodes.clone(), DiscoveryProtocol::Discv5)?;
+            contacts
+                .new_contacts(bootnodes.clone(), DiscoveryProtocol::Discv5)
+                .await;
             Some(Discv5State::default())
         } else {
             None
@@ -176,7 +260,7 @@ impl DiscoveryServer {
             local_node_record,
             signer,
             udp_socket: udp_socket.clone(),
-            peer_table: peer_table.clone(),
+            contacts,
             ip_predictor: IpPredictor::default(),
             ip_override_locked,
             config,
@@ -193,9 +277,7 @@ impl DiscoveryServer {
             }
         }
 
-        server.start();
-
-        Ok(())
+        Ok(server.start())
     }
 
     #[started]
@@ -302,7 +384,7 @@ impl DiscoveryServer {
         let _ = self.discv4_lookup().await.inspect_err(
             |e| error!(protocol = "discv4", err=?e, "Error performing Discovery lookup"),
         );
-        let interval = self.get_lookup_interval().await;
+        let interval = self.get_lookup_interval();
         send_after(interval, ctx.clone(), discovery_server_protocol::LookupV4);
     }
 
@@ -316,7 +398,7 @@ impl DiscoveryServer {
         let _ = self.discv5_lookup().await.inspect_err(
             |e| error!(protocol = "discv5", err=?e, "Error performing Discovery lookup"),
         );
-        let interval = self.get_lookup_interval().await;
+        let interval = self.get_lookup_interval();
         send_after(interval, ctx.clone(), discovery_server_protocol::LookupV5);
     }
 
@@ -330,7 +412,7 @@ impl DiscoveryServer {
         let _ = self.discv4_enr_lookup().await.inspect_err(
             |e| error!(protocol = "discv4", err=?e, "Error performing Discovery lookup"),
         );
-        let interval = self.get_lookup_interval().await;
+        let interval = self.get_lookup_interval();
         send_after(interval, ctx.clone(), discovery_server_protocol::EnrLookup);
     }
 
@@ -341,6 +423,24 @@ impl DiscoveryServer {
             .prune()
             .await
             .inspect_err(|e| error!(err=?e, "Error Pruning peer table"));
+    }
+
+    #[send_handler]
+    async fn handle_record_peer_event(
+        &mut self,
+        msg: discovery_server_protocol::RecordPeerEvent,
+        _ctx: &Context<Self>,
+    ) {
+        self.contacts.record_peer_event(msg.node_id, msg.event);
+    }
+
+    #[request_handler]
+    async fn handle_next_dial_candidate(
+        &mut self,
+        _msg: discovery_server_protocol::NextDialCandidate,
+        _ctx: &Context<Self>,
+    ) -> Option<Node> {
+        self.contacts.next_dial_candidate()
     }
 
     #[send_handler]
@@ -405,7 +505,7 @@ impl DiscoveryServer {
     }
 
     async fn prune(&mut self) -> Result<(), DiscoveryServerError> {
-        self.peer_table.prune_table()?;
+        self.contacts.prune();
         if let Some(discv4) = &mut self.discv4 {
             let expiration = Duration::from_secs(crate::discv4::server::EXPIRATION_SECONDS);
             discv4
@@ -467,12 +567,8 @@ impl DiscoveryServer {
         guard.record = self.local_node_record.clone();
     }
 
-    pub(crate) async fn get_lookup_interval(&self) -> Duration {
-        let peer_completion = self
-            .peer_table
-            .target_peers_completion()
-            .await
-            .unwrap_or_default();
+    pub(crate) fn get_lookup_interval(&self) -> Duration {
+        let peer_completion = self.contacts.peer_completion();
         lookup_interval_function(
             peer_completion,
             ITERATIVE_LOOKUP_INITIAL_MS,
@@ -527,6 +623,12 @@ pub fn is_discv4_packet(data: &[u8]) -> bool {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl DiscoveryServer {
+    /// The contact table this server owns, so a test can seed it before driving
+    /// the handlers by hand.
+    pub fn contacts_mut(&mut self) -> &mut ContactTable {
+        &mut self.contacts
+    }
+
     /// Builds a DiscoveryServer suitable for unit tests of discv5 handlers.
     /// Only discv5 state is initialized; discv4 is disabled.
     /// Uses a dummy initial lookup interval.
@@ -535,10 +637,12 @@ impl DiscoveryServer {
         local_node_record: NodeRecord,
         signer: SecretKey,
         udp_socket: Arc<UdpSocket>,
-        peer_table: PeerTable,
+        filter: Box<dyn PeerFilter>,
     ) -> Self {
         use crate::types::LocalNode;
         use std::sync::{Arc, RwLock};
+
+        let local_node_id = local_node.node_id();
         let shared_local_node = Arc::new(RwLock::new(LocalNode {
             node: local_node.clone(),
             record: local_node_record.clone(),
@@ -548,10 +652,11 @@ impl DiscoveryServer {
             local_node_record,
             signer,
             udp_socket,
-            peer_table,
+            contacts: ContactTable::new(local_node_id, 10, filter),
             config: DiscoveryConfig {
                 discv4_enabled: false,
                 discv5_enabled: true,
+                target_peers: 10,
                 nat_extip_set: false,
             },
             discv4: None,
@@ -570,7 +675,8 @@ impl DiscoveryServer {
 mod tests {
     use super::*;
     use crate::{
-        peer_table::{PeerTableServer, TARGET_PEERS},
+        peer_filter::AcceptAllFilter,
+        peer_table::TARGET_PEERS,
         types::{INITIAL_ENR_SEQ, LocalNode},
     };
     use ethrex_common::H256;
@@ -585,6 +691,7 @@ mod tests {
         let signer = SecretKey::new(&mut rand::rngs::OsRng);
         let pubkey = crate::utils::public_key_from_signing_key(&signer);
         let local_node = Node::new(ip, 30303, 30303, pubkey);
+        let local_node_id = local_node.node_id();
         let local_node_record =
             NodeRecord::from_node(&local_node, INITIAL_ENR_SEQ, &signer).unwrap();
         let shared_local_node = Arc::new(RwLock::new(LocalNode {
@@ -592,18 +699,16 @@ mod tests {
             record: local_node_record.clone(),
         }));
         let udp_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let peer_table = PeerTableServer::spawn(H256::random(), TARGET_PEERS, {
-            ethrex_storage::Store::new("", ethrex_storage::EngineType::InMemory).unwrap()
-        });
         DiscoveryServer {
             local_node,
             local_node_record,
             signer,
             udp_socket,
-            peer_table,
+            contacts: ContactTable::new(local_node_id, TARGET_PEERS, Box::new(AcceptAllFilter)),
             config: DiscoveryConfig {
                 discv4_enabled: false,
                 discv5_enabled: false,
+                target_peers: TARGET_PEERS,
                 nat_extip_set: ip_override_locked,
             },
             discv4: None,
@@ -614,6 +719,26 @@ mod tests {
             fork_id: tokio::sync::watch::channel(None).1,
             shared_local_node,
         }
+    }
+
+    #[tokio::test]
+    async fn an_unpublished_handle_is_inert() {
+        // Every consumer holds this handle from the moment the P2P context is
+        // built, which is before discovery starts and forever if p2p runs
+        // without it. Casts must be dropped quietly and the one request must
+        // answer `None` rather than wait for a server that may never arrive.
+        let handle = DiscoveryHandle::new();
+
+        for event in [
+            PeerEvent::Connected,
+            PeerEvent::Disconnected,
+            PeerEvent::Rejected,
+        ] {
+            handle.record_peer_event(H256::repeat_byte(1), event);
+        }
+        handle.prune();
+
+        assert!(handle.next_dial_candidate().await.is_none());
     }
 
     /// apply_predicted_ip from unspecified -> public must update local_node, bump ENR seq,

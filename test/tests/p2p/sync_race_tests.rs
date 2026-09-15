@@ -94,7 +94,7 @@ async fn chain_at_fresh_tip() -> (Store, Arc<Blockchain>, BlockHeader) {
 
 async fn sync_manager_for(store: &Store, blockchain: Arc<Blockchain>) -> SyncManager {
     SyncManager::new(
-        dummy_peer_handler(store.clone()).await,
+        dummy_peer_handler().await,
         &SyncMode::Full,
         CancellationToken::new(),
         blockchain,

@@ -1,4 +1,4 @@
-use crate::peer_table::xor_distance;
+use crate::discovery::contact_table::xor_distance;
 use crate::types::Node;
 use ethrex_common::H256;
 use rustc_hash::FxHashSet;

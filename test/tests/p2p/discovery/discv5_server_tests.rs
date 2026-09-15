@@ -1,11 +1,10 @@
 use bytes::Bytes;
 use ethrex_common::H256;
 use ethrex_p2p::discovery::DiscoveryServer;
+use ethrex_p2p::discovery::{ContactTable, Session as ContactSession};
 use ethrex_p2p::discv5::messages::PongMessage;
-use ethrex_p2p::discv5::session::Session;
-use ethrex_p2p::peer_table::{PeerTable, PeerTableServer, PeerTableServerProtocol as _};
+use ethrex_p2p::peer_filter::AcceptAllFilter;
 use ethrex_p2p::types::{Node, NodeRecord};
-use ethrex_storage::{EngineType, Store};
 use rand::{SeedableRng, rngs::StdRng};
 use rustc_hash::FxHashSet;
 use secp256k1::SecretKey;
@@ -16,25 +15,18 @@ use std::{
 };
 use tokio::net::UdpSocket;
 
-async fn test_server(peer_table: Option<PeerTable>) -> DiscoveryServer {
+async fn test_server() -> DiscoveryServer {
     let local_node = Node::from_enode_url(
         "enode://d860a01f9722d78051619d1e2351aba3f43f943f6f00718d1b9baa4101932a1f5011f16bb2b1bb35db20d6fe28fa0bf09636d26a87d31de9ec6203eeedb1f666@18.138.108.67:30303",
     ).expect("Bad enode url");
     let signer = SecretKey::new(&mut rand::rngs::OsRng);
     let local_node_record = NodeRecord::from_node(&local_node, 1, &signer).unwrap();
-    let peer_table = peer_table.unwrap_or_else(|| {
-        PeerTableServer::spawn(
-            local_node.node_id(),
-            10,
-            Store::new("", EngineType::InMemory).expect("Failed to create store"),
-        )
-    });
     DiscoveryServer::new_for_discv5_test(
         local_node,
         local_node_record,
         signer,
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
-        peer_table,
+        Box::new(AcceptAllFilter),
     )
 }
 
@@ -46,7 +38,7 @@ fn discv5(server: &mut DiscoveryServer) -> &mut ethrex_p2p::discv5::server::Disc
 #[tokio::test]
 async fn test_next_nonce_counter() {
     let mut rng = StdRng::seed_from_u64(7);
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
 
     let n1 = discv5(&mut server).next_nonce(&mut rng);
     let n2 = discv5(&mut server).next_nonce(&mut rng);
@@ -58,7 +50,7 @@ async fn test_next_nonce_counter() {
 
 #[tokio::test]
 async fn test_whoareyou_rate_limiting() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
 
     let nonce = [0u8; 12];
     // Use a public IP so rate limiting is actually exercised (private IPs are exempt).
@@ -109,7 +101,7 @@ async fn test_whoareyou_rate_limiting() {
 
 #[tokio::test]
 async fn test_global_whoareyou_rate_limiting() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
     let nonce = [0u8; 12];
 
     discv5(&mut server).whoareyou_global_window_start = Instant::now();
@@ -139,7 +131,7 @@ async fn test_global_whoareyou_rate_limiting() {
 
 #[tokio::test]
 async fn test_whoareyou_rate_limit_lru_cache_works() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
     let nonce = [0u8; 12];
 
     // Bypass the global rate limit so we can insert many entries
@@ -175,34 +167,29 @@ async fn test_enr_update_request_on_pong() {
     let remote_node = Node::from_enr(&remote_record).expect("Should create node from record");
     let remote_node_id = remote_node.node_id();
 
-    let peer_table = PeerTableServer::spawn(
-        local_node.node_id(),
-        10,
-        Store::new("", EngineType::InMemory).expect("Failed to create store"),
+    let mut contacts = ContactTable::new(local_node.node_id(), 10, Box::new(AcceptAllFilter));
+    contacts.new_contact_records(vec![remote_record]).await;
+    contacts.set_session(
+        remote_node_id,
+        ContactSession {
+            outbound_key: [0u8; 16],
+            inbound_key: [0u8; 16],
+        },
     );
-
-    peer_table.new_contact_records(vec![remote_record]).unwrap();
-
-    let session = Session {
-        outbound_key: [0u8; 16],
-        inbound_key: [0u8; 16],
-    };
-    peer_table
-        .set_session_info(remote_node_id, session)
-        .unwrap();
 
     let mut server = DiscoveryServer::new_for_discv5_test(
         local_node,
         local_node_record,
         signer,
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
-        peer_table,
+        Box::new(AcceptAllFilter),
     );
+    *server.contacts_mut() = contacts;
 
-    let contact = server.peer_table.get_contact(remote_node_id).await.unwrap();
+    let contact = server.contacts_mut().get_contact(&remote_node_id).cloned();
     assert!(
         contact.is_some(),
-        "Contact should have been added to peer_table"
+        "Contact should have been added to the contact table"
     );
     let contact = contact.unwrap();
     assert_eq!(
@@ -260,7 +247,7 @@ async fn test_enr_update_request_on_pong() {
 
 #[tokio::test]
 async fn test_ip_voting_updates_ip_on_threshold() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
     let original_ip = server.local_node.ip;
 
     let new_ip: IpAddr = "203.0.113.50".parse().unwrap();
@@ -287,7 +274,7 @@ async fn test_ip_voting_updates_ip_on_threshold() {
 
 #[tokio::test]
 async fn test_ip_voting_same_peer_votes_once() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
 
     let new_ip: IpAddr = "203.0.113.50".parse().unwrap();
     let same_voter = H256::from_low_u64_be(1);
@@ -304,7 +291,7 @@ async fn test_ip_voting_same_peer_votes_once() {
 
 #[tokio::test]
 async fn test_ip_voting_no_update_if_same_ip() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
     let original_ip = server.local_node.ip;
 
     let voter1 = H256::from_low_u64_be(1);
@@ -322,7 +309,7 @@ async fn test_ip_voting_no_update_if_same_ip() {
 
 #[tokio::test]
 async fn test_handle_pong_same_ip_does_not_bump_enr_seq() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
     let original_ip = server.local_node.ip;
     let original_seq = server.local_node_record.seq;
 
@@ -352,7 +339,7 @@ async fn test_handle_pong_same_ip_does_not_bump_enr_seq() {
 
 #[tokio::test]
 async fn test_ip_voting_split_votes_no_update() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
     let original_ip = server.local_node.ip;
 
     let ip1: IpAddr = "203.0.113.50".parse().unwrap();
@@ -375,7 +362,7 @@ async fn test_ip_voting_split_votes_no_update() {
 
 #[tokio::test]
 async fn test_ip_vote_cleanup() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
 
     let ip: IpAddr = "203.0.113.50".parse().unwrap();
     let voter1 = H256::from_low_u64_be(1);
@@ -394,7 +381,7 @@ async fn test_ip_vote_cleanup() {
 
 #[tokio::test]
 async fn test_ip_voting_ignores_unroutable_but_keeps_private() {
-    let mut server = test_server(None).await;
+    let mut server = test_server().await;
     let voter1 = H256::from_low_u64_be(1);
 
     // Unroutable addresses can never be a valid externally-advertised endpoint

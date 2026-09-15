@@ -227,3 +227,23 @@ pub fn distance(node_id_1: &H256, node_id_2: &H256) -> usize {
     let distance = U256::from_big_endian(xor.as_bytes());
     distance.bits()
 }
+
+/// Decompresses the received public key
+pub fn decompress_pubkey(pk: &PublicKey) -> H512 {
+    let bytes = pk.serialize_uncompressed();
+    debug_assert_eq!(bytes[0], 4);
+    H512::from_slice(&bytes[1..])
+}
+
+/// Compresses the received public key
+/// The received value is the uncompressed public key of a node, with the first byte omitted (0x04).
+///
+/// Lives here rather than under `rlpx` because it is plain secp256k1 point handling that
+/// discv5's handshake needs too, and importing it from `rlpx` was the last thing tying
+/// discovery to the wire protocol.
+pub fn compress_pubkey(pk: H512) -> Option<PublicKey> {
+    let mut full_pk = [0u8; 65];
+    full_pk[0] = 0x04;
+    full_pk[1..].copy_from_slice(&pk.0);
+    PublicKey::from_slice(&full_pk).ok()
+}

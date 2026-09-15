@@ -152,8 +152,12 @@ pub async fn sync_cycle_snap(
     let mut attempts = 0;
 
     loop {
-        // Prune dead/unresponsive peers periodically to allow replacements to be promoted
-        let _ = peers.peer_table.prune_table();
+        // Prune dead/unresponsive contacts periodically to allow replacements to be
+        // promoted. Note this runs discovery's whole prune, not just the k-bucket walk:
+        // it also expires discv5 sessions and can finalise an IP-vote round. All of that
+        // is time-gated and the discovery server already runs the same call every five
+        // seconds, so this only ever brings the next sweep forward.
+        peers.discovery.prune();
 
         debug!("Requesting Block Headers from {current_head}");
 

@@ -474,6 +474,7 @@ pub async fn init_network(
     let discovery_config = DiscoveryConfig {
         discv4_enabled: opts.discv4_enabled,
         discv5_enabled: opts.discv5_enabled,
+        target_peers: opts.target_peers,
         nat_extip_set: opts.nat_extip.is_some(),
     };
 
@@ -944,8 +945,7 @@ pub async fn init_l1(
         record: local_node_record,
     }));
 
-    let peer_table =
-        PeerTableServer::spawn(local_p2p_node.node_id(), opts.target_peers, store.clone());
+    let peer_table = PeerTableServer::spawn(opts.target_peers);
 
     // TODO: Check every module starts properly.
     let tracker = TaskTracker::new();
@@ -969,7 +969,8 @@ pub async fn init_l1(
 
     let initiator = RLPxInitiator::spawn(p2p_context.clone());
 
-    let peer_handler = PeerHandler::new(peer_table.clone(), initiator);
+    let peer_handler =
+        PeerHandler::new(peer_table.clone(), initiator, p2p_context.discovery.clone());
 
     init_rpc_api(
         &opts,
